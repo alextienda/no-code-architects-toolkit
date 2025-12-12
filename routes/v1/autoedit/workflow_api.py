@@ -22,7 +22,7 @@ Provides REST API for AutoEdit workflow management:
 """
 
 from flask import Blueprint, jsonify, request
-from app_utils import validate_payload
+from app_utils import validate_payload, queue_task_wrapper
 from services.authentication import authenticate
 from services.v1.autoedit.workflow import (
     get_workflow_manager,
@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
     "required": ["video_url"],
     "additionalProperties": False
 })
+@queue_task_wrapper(bypass_queue=True)
 def create_workflow(job_id, data):
     """Create a new AutoEdit workflow.
 
@@ -88,16 +89,16 @@ def create_workflow(job_id, data):
         manager = get_workflow_manager()
         workflow_id = manager.create(video_url, options)
 
-        return jsonify({
+        return {
             "workflow_id": workflow_id,
             "status": "created",
             "status_message": WORKFLOW_STATES["created"],
             "message": "Workflow created successfully"
-        }), 201
+        }, "/v1/autoedit/workflow", 201
 
     except Exception as e:
         logger.error(f"Error creating workflow: {e}")
-        return jsonify({"error": str(e)}), 500
+        return {"error": str(e)}, "/v1/autoedit/workflow", 500
 
 
 @v1_autoedit_workflow_api_bp.route('/v1/autoedit/workflow/<workflow_id>', methods=['GET'])
@@ -311,6 +312,7 @@ def get_analysis_for_review(workflow_id):
     "required": ["updated_xml"],
     "additionalProperties": False
 })
+@queue_task_wrapper(bypass_queue=True)
 def submit_reviewed_xml(job_id, data):
     """Submit the user-reviewed XML after HITL 1 modifications.
 
@@ -329,6 +331,7 @@ def submit_reviewed_xml(job_id, data):
     # Get workflow_id from URL
     workflow_id = request.view_args.get('workflow_id')
     _ = job_id  # Not used for this endpoint
+    endpoint = f"/v1/autoedit/workflow/{workflow_id}/analysis"
 
     logger.info(f"Submitting reviewed XML for workflow: {workflow_id}")
 
@@ -337,42 +340,42 @@ def submit_reviewed_xml(job_id, data):
         workflow = manager.get(workflow_id)
 
         if not workflow:
-            return jsonify({
+            return {
                 "error": "Workflow not found",
                 "workflow_id": workflow_id
-            }), 404
+            }, endpoint, 404
 
         # Validate workflow is in correct state
         if workflow["status"] not in ["pending_review_1", "xml_approved"]:
-            return jsonify({
+            return {
                 "error": f"Cannot submit XML. Workflow status is '{workflow['status']}'. Expected 'pending_review_1'.",
                 "workflow_id": workflow_id
-            }), 400
+            }, endpoint, 400
 
         updated_xml = data["updated_xml"]
 
         # Basic XML validation
         if "<resultado>" not in updated_xml:
-            return jsonify({
+            return {
                 "error": "Invalid XML format. Expected <resultado> root element.",
                 "workflow_id": workflow_id
-            }), 400
+            }, endpoint, 400
 
         # Store the user-modified XML
         success = manager.set_user_xml(workflow_id, updated_xml)
 
         if success:
-            return jsonify({
+            return {
                 "workflow_id": workflow_id,
                 "status": "xml_approved",
                 "message": "XML approved. Ready for processing to blocks."
-            }), 200
+            }, endpoint, 200
         else:
-            return jsonify({
+            return {
                 "error": "Failed to save XML",
                 "workflow_id": workflow_id
-            }), 500
+            }, endpoint, 500
 
     except Exception as e:
         logger.error(f"Error submitting XML for {workflow_id}: {e}")
-        return jsonify({"error": str(e), "workflow_id": workflow_id}), 500
+        return {"error": str(e), "workflow_id": workflow_id}, endpoint, 500
