@@ -400,6 +400,7 @@ def get_preview(workflow_id):
     "required": ["modifications"],
     "additionalProperties": False
 })
+@queue_task_wrapper(bypass_queue=True)
 def modify_blocks_endpoint(job_id, data):
     """Modify blocks (adjust, split, merge, delete, restore gap).
 
@@ -421,33 +422,34 @@ def modify_blocks_endpoint(job_id, data):
     modifications = data.get('modifications', [])
 
     logger.info(f"Modifying blocks for workflow {workflow_id}: {len(modifications)} modifications")
+    endpoint = f"/v1/autoedit/workflow/{workflow_id}/blocks"
 
     try:
         manager = get_workflow_manager()
         workflow = manager.get(workflow_id)
 
         if not workflow:
-            return jsonify({
+            return {
                 "error": "Workflow not found",
                 "workflow_id": workflow_id
-            }), 404
+            }, endpoint, 404
 
         # Check workflow state
         valid_states = ["pending_review_2", "modifying_blocks", "regenerating_preview"]
         if workflow["status"] not in valid_states:
-            return jsonify({
+            return {
                 "error": f"Cannot modify blocks. Status is '{workflow['status']}'. Expected one of: {valid_states}",
                 "workflow_id": workflow_id
-            }), 400
+            }, endpoint, 400
 
         blocks = workflow.get("blocks", [])
         gaps = workflow.get("gaps", [])
 
         if not blocks:
-            return jsonify({
+            return {
                 "error": "No blocks available",
                 "workflow_id": workflow_id
-            }), 400
+            }, endpoint, 400
 
         # Apply modifications
         updated_blocks, updated_gaps, errors = apply_modifications(blocks, gaps, modifications)
@@ -474,7 +476,7 @@ def modify_blocks_endpoint(job_id, data):
         # Recalculate stats
         stats = calculate_stats(updated_blocks, video_duration_ms)
 
-        return jsonify({
+        return {
             "workflow_id": workflow_id,
             "blocks": updated_blocks,
             "gaps": updated_gaps,
@@ -482,10 +484,10 @@ def modify_blocks_endpoint(job_id, data):
             "needs_preview_regeneration": True,
             "errors": errors if errors else None,
             "message": "Blocks modified. Regenerate preview to see changes."
-        }), 200
+        }, endpoint, 200
 
     except Exception as e:
         logger.error(f"Error modifying blocks for {workflow_id}: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return jsonify({"error": str(e), "workflow_id": workflow_id}), 500
+        return {"error": str(e), "workflow_id": workflow_id}, endpoint, 500
