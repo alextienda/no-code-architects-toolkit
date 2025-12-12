@@ -102,7 +102,15 @@ async function uploadVideoAndCreateWorkflow(file) {
     })
   });
 
-  return await workflowResponse.json();
+  const data = await workflowResponse.json();
+
+  // ⚠️ IMPORTANTE: El workflow_id está en data.response.workflow_id
+  // NO en data.workflow_id (que sería undefined)
+  return {
+    workflow_id: data.response.workflow_id,
+    status: data.response.status,
+    raw_response: data  // Por si necesitas acceso al response completo
+  };
 }
 ```
 
@@ -140,13 +148,99 @@ function uploadWithProgress(file, uploadUrl, contentType, onProgress) {
 ## Tabla de Contenidos
 
 1. [Subir Videos desde el Frontend](#subir-videos-desde-el-frontend)
-2. [Flujo Completo del Usuario](#flujo-completo-del-usuario)
-3. [Estados del Workflow](#estados-del-workflow)
-4. [HITL 1: Editor de XML](#hitl-1-editor-de-xml)
-5. [HITL 2: Editor de Timeline](#hitl-2-editor-de-timeline)
-6. [Ejemplos de Código](#ejemplos-de-código)
-7. [Manejo de Errores](#manejo-de-errores)
-8. [Best Practices](#best-practices)
+2. [Formato de Respuestas](#formato-de-respuestas)
+3. [Flujo Completo del Usuario](#flujo-completo-del-usuario)
+4. [Estados del Workflow](#estados-del-workflow)
+5. [HITL 1: Editor de XML](#hitl-1-editor-de-xml)
+6. [HITL 2: Editor de Timeline](#hitl-2-editor-de-timeline)
+7. [Ejemplos de Código](#ejemplos-de-código)
+8. [Manejo de Errores](#manejo-de-errores)
+9. [Best Practices](#best-practices)
+
+---
+
+## Formato de Respuestas
+
+### ⚠️ IMPORTANTE: Response Wrapper
+
+Los endpoints POST/PUT/PATCH del NCA Toolkit envuelven la respuesta en un objeto wrapper.
+**El `workflow_id` NO está en el nivel raíz**, sino dentro de `response`.
+
+### Ejemplo de Response Wrapped (POST /v1/autoedit/workflow)
+
+```json
+{
+  "code": 201,
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "response": {
+    "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "created",
+    "message": "Workflow created successfully"
+  },
+  "message": "success",
+  "run_time": 0.045,
+  "endpoint": "/v1/autoedit/workflow"
+}
+```
+
+### Extracción Correcta del workflow_id
+
+```javascript
+// ✅ CORRECTO
+const data = await response.json();
+const workflowId = data.response.workflow_id;
+
+// ❌ INCORRECTO - Retorna undefined
+const workflowId = data.workflow_id;
+```
+
+### Función Helper Recomendada
+
+```javascript
+/**
+ * Extrae datos de respuestas wrapped del NCA Toolkit
+ * @param {Response} response - Fetch response
+ * @returns {Object} - Datos extraídos
+ */
+async function parseNCAResponse(response) {
+  const data = await response.json();
+
+  // Verificar si es respuesta wrapped o directa
+  if (data.response && data.code !== undefined) {
+    // Response wrapped (POST, PUT, PATCH)
+    if (data.code >= 400) {
+      throw new Error(data.message?.error || data.message || 'Request failed');
+    }
+    return data.response;
+  }
+
+  // Response directa (GET, DELETE)
+  if (data.error) {
+    throw new Error(data.error);
+  }
+  return data;
+}
+
+// Uso:
+const workflowData = await parseNCAResponse(response);
+console.log(workflowData.workflow_id);  // Funciona para ambos tipos
+```
+
+### Tabla de Formatos por Endpoint
+
+| Endpoint | Método | Wrapper | Cómo extraer workflow_id |
+|----------|--------|---------|--------------------------|
+| `/v1/autoedit/workflow` | POST | ✅ Sí | `data.response.workflow_id` |
+| `/v1/autoedit/workflow/{id}` | GET | ❌ No | `data.workflow_id` |
+| `/v1/autoedit/workflow/{id}` | DELETE | ❌ No | `data.workflow_id` |
+| `/v1/autoedit/workflow/{id}/analysis` | GET | ❌ No | `data.workflow_id` |
+| `/v1/autoedit/workflow/{id}/analysis` | PUT | ✅ Sí | `data.response.workflow_id` |
+| `/v1/autoedit/workflow/{id}/process` | POST | ✅ Sí | `data.response.workflow_id` |
+| `/v1/autoedit/workflow/{id}/preview` | POST | ✅ Sí | `data.response.workflow_id` |
+| `/v1/autoedit/workflow/{id}/preview` | GET | ❌ No | `data.workflow_id` |
+| `/v1/autoedit/workflow/{id}/blocks` | PATCH | ✅ Sí | `data.response.workflow_id` |
+| `/v1/autoedit/workflow/{id}/render` | POST | ✅ Sí | `data.response.workflow_id` |
+| `/v1/autoedit/workflow/{id}/result` | GET | ❌ No | `data.workflow_id` |
 
 ---
 

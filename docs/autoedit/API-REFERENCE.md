@@ -43,20 +43,96 @@ curl -X POST "${NCA_TOOLKIT_URL}/v1/autoedit/workflow" \
 
 ## Formato de Respuesta
 
-Todas las respuestas siguen el formato estándar del NCA Toolkit:
+### Endpoints con Wrapper (POST, PUT, PATCH con `@queue_task_wrapper`)
+
+Los endpoints que modifican datos retornan una respuesta envuelta (wrapped):
 
 ```json
 {
-  "code": 200,
-  "id": "user_provided_id",
-  "job_id": "uuid-generado",
-  "response": { ... },
+  "code": 201,
+  "id": null,
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "response": {
+    "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "created",
+    "status_message": "Workflow creado",
+    "message": "Workflow created successfully"
+  },
   "message": "success",
-  "run_time": 1.234,
-  "queue_time": 0.567,
-  "total_time": 1.801
+  "run_time": 0.045,
+  "queue_time": 0,
+  "total_time": 0.045,
+  "endpoint": "/v1/autoedit/workflow",
+  "pid": 12345,
+  "queue_id": 140234567890,
+  "queue_length": 0,
+  "build_number": "219"
 }
 ```
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `code` | integer | HTTP status code |
+| `id` | string \| null | ID proporcionado en el request |
+| `job_id` | string | UUID único del job |
+| `response` | object | **Datos del endpoint (aquí está el workflow_id)** |
+| `message` | string | "success" o detalles del error |
+| `run_time` | float | Tiempo de ejecución en segundos |
+| `queue_time` | float | Tiempo en cola |
+| `total_time` | float | Tiempo total |
+| `endpoint` | string | Path del endpoint |
+
+> **⚠️ IMPORTANTE para Frontend**: El `workflow_id` está en `response.workflow_id`, NO en el nivel raíz.
+
+### Endpoints sin Wrapper (GET, DELETE)
+
+Los endpoints de lectura retornan directamente el objeto sin wrapper:
+
+```json
+{
+  "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "pending_review_1",
+  "created_at": "2025-01-15T10:30:00Z",
+  ...
+}
+```
+
+### Extracción de workflow_id (JavaScript)
+
+```javascript
+// ✅ CORRECTO - POST /v1/autoedit/workflow
+const createResponse = await fetch('/v1/autoedit/workflow', {...});
+const createData = await createResponse.json();
+const workflowId = createData.response.workflow_id;  // ← En response.workflow_id
+
+// ✅ CORRECTO - GET /v1/autoedit/workflow/{id}
+const statusResponse = await fetch(`/v1/autoedit/workflow/${workflowId}`, {...});
+const statusData = await statusResponse.json();
+const status = statusData.status;  // ← Directo, sin wrapper
+
+// ❌ INCORRECTO
+const workflowId = createData.workflow_id;  // undefined!
+```
+
+### Tabla Resumen de Formatos
+
+| Método | Endpoint | Wrapper | Ubicación de workflow_id |
+|--------|----------|---------|--------------------------|
+| POST | `/workflow` | Sí | `response.workflow_id` |
+| GET | `/workflow/{id}` | No | `workflow_id` |
+| DELETE | `/workflow/{id}` | No | `workflow_id` |
+| GET | `/workflows` | No | `workflows[].workflow_id` |
+| GET | `/workflow/{id}/analysis` | No | `workflow_id` |
+| PUT | `/workflow/{id}/analysis` | Sí | `response.workflow_id` |
+| POST | `/workflow/{id}/process` | Sí | `response.workflow_id` |
+| POST | `/workflow/{id}/preview` | Sí | `response.workflow_id` |
+| GET | `/workflow/{id}/preview` | No | `workflow_id` |
+| PATCH | `/workflow/{id}/blocks` | Sí | `response.workflow_id` |
+| POST | `/workflow/{id}/render` | Sí | `response.workflow_id` |
+| GET | `/workflow/{id}/render` | No | `workflow_id` |
+| GET | `/workflow/{id}/result` | No | `workflow_id` |
+| POST | `/workflow/{id}/rerender` | Sí | `response.workflow_id` |
+| GET | `/workflow/{id}/estimate` | No | `workflow_id` |
 
 ---
 
