@@ -14,9 +14,9 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request
 from services.authentication import authenticate
-from app_utils import validate_payload
+from app_utils import validate_payload, queue_task_wrapper
 from services.v1.gcp.signed_url import generate_signed_upload_url, generate_signed_download_url
 import logging
 
@@ -29,69 +29,20 @@ v1_gcp_signed_url_bp = Blueprint('v1_gcp_signed_url', __name__)
 @validate_payload({
     "type": "object",
     "properties": {
-        "filename": {
-            "type": "string",
-            "description": "Name of the file to upload"
-        },
-        "content_type": {
-            "type": "string",
-            "description": "MIME type of the file",
-            "default": "video/mp4"
-        },
-        "expiration_minutes": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 60,
-            "description": "URL expiration time in minutes (1-60)",
-            "default": 15
-        },
-        "folder": {
-            "type": "string",
-            "description": "Optional folder/prefix for the file path"
-        }
+        "filename": {"type": "string"},
+        "content_type": {"type": "string"},
+        "expiration_minutes": {"type": "integer", "minimum": 1, "maximum": 60},
+        "folder": {"type": "string"}
     },
     "required": ["filename"],
     "additionalProperties": False
 })
-def gcp_signed_upload_url_endpoint():
+@queue_task_wrapper(bypass_queue=True)
+def gcp_signed_upload_url_endpoint(job_id, data):
     """
     Generate a signed URL for uploading a file directly to GCS.
-
-    This allows frontend clients to upload files directly to Google Cloud Storage
-    without routing through the backend, improving performance and reducing server load.
-
-    Request:
-        {
-            "filename": "video.mp4",
-            "content_type": "video/mp4",  // optional, default: video/mp4
-            "expiration_minutes": 15,     // optional, default: 15, max: 60
-            "folder": "uploads/user123"   // optional
-        }
-
-    Response:
-        {
-            "upload_url": "https://storage.googleapis.com/...",  // Use PUT to upload
-            "public_url": "https://storage.googleapis.com/bucket/path/file",
-            "filename": "video.mp4",
-            "blob_path": "uploads/user123/video.mp4",
-            "bucket": "bucket-name",
-            "content_type": "video/mp4",
-            "expires_in_minutes": 15,
-            "method": "PUT",
-            "headers_required": {
-                "Content-Type": "video/mp4"
-            }
-        }
-
-    Frontend Usage:
-        1. Call this endpoint to get a signed URL
-        2. Use fetch/XMLHttpRequest to PUT the file directly to upload_url
-        3. Include Content-Type header matching content_type from response
-        4. After upload completes, use public_url to reference the file
     """
     try:
-        data = request.get_json()
-
         filename = data.get('filename')
         content_type = data.get('content_type', 'video/mp4')
         expiration_minutes = data.get('expiration_minutes', 15)
@@ -104,15 +55,15 @@ def gcp_signed_upload_url_endpoint():
             folder=folder
         )
 
-        logger.info(f"Generated signed upload URL for {filename}")
-        return jsonify(result), 200
+        logger.info(f"Job {job_id}: Generated signed upload URL for {filename}")
+        return result, "/v1/gcp/signed-upload-url", 200
 
     except ValueError as e:
-        logger.error(f"Validation error generating signed URL: {str(e)}")
-        return jsonify({"error": str(e)}), 400
+        logger.error(f"Job {job_id}: Validation error - {str(e)}")
+        return {"error": str(e)}, "/v1/gcp/signed-upload-url", 400
     except Exception as e:
-        logger.error(f"Error generating signed upload URL: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Job {job_id}: Error generating signed upload URL - {str(e)}")
+        return {"error": str(e)}, "/v1/gcp/signed-upload-url", 500
 
 
 @v1_gcp_signed_url_bp.route('/v1/gcp/signed-download-url', methods=['POST'])
@@ -120,42 +71,18 @@ def gcp_signed_upload_url_endpoint():
 @validate_payload({
     "type": "object",
     "properties": {
-        "blob_path": {
-            "type": "string",
-            "description": "Path to the blob in the bucket"
-        },
-        "expiration_minutes": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 1440,
-            "description": "URL expiration time in minutes (1-1440)",
-            "default": 60
-        }
+        "blob_path": {"type": "string"},
+        "expiration_minutes": {"type": "integer", "minimum": 1, "maximum": 1440}
     },
     "required": ["blob_path"],
     "additionalProperties": False
 })
-def gcp_signed_download_url_endpoint():
+@queue_task_wrapper(bypass_queue=True)
+def gcp_signed_download_url_endpoint(job_id, data):
     """
     Generate a signed URL for downloading a file from GCS.
-
-    Request:
-        {
-            "blob_path": "uploads/user123/video.mp4",
-            "expiration_minutes": 60  // optional, default: 60, max: 1440 (24h)
-        }
-
-    Response:
-        {
-            "download_url": "https://storage.googleapis.com/...",
-            "blob_path": "uploads/user123/video.mp4",
-            "bucket": "bucket-name",
-            "expires_in_minutes": 60
-        }
     """
     try:
-        data = request.get_json()
-
         blob_path = data.get('blob_path')
         expiration_minutes = data.get('expiration_minutes', 60)
 
@@ -164,12 +91,12 @@ def gcp_signed_download_url_endpoint():
             expiration_minutes=expiration_minutes
         )
 
-        logger.info(f"Generated signed download URL for {blob_path}")
-        return jsonify(result), 200
+        logger.info(f"Job {job_id}: Generated signed download URL for {blob_path}")
+        return result, "/v1/gcp/signed-download-url", 200
 
     except ValueError as e:
-        logger.error(f"Validation error generating signed URL: {str(e)}")
-        return jsonify({"error": str(e)}), 400
+        logger.error(f"Job {job_id}: Validation error - {str(e)}")
+        return {"error": str(e)}, "/v1/gcp/signed-download-url", 400
     except Exception as e:
-        logger.error(f"Error generating signed download URL: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Job {job_id}: Error generating signed download URL - {str(e)}")
+        return {"error": str(e)}, "/v1/gcp/signed-download-url", 500
