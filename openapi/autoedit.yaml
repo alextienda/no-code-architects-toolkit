@@ -1,0 +1,1361 @@
+openapi: 3.0.3
+info:
+  title: AutoEdit API
+  description: |
+    API para edición automática de video con AI.
+
+    ## Flujo del Workflow
+
+    1. **Crear workflow** - POST /v1/autoedit/workflow
+    2. **Esperar transcripción y análisis** - Polling GET /v1/autoedit/workflow/{id}
+    3. **HITL 1: Revisar XML** - GET/PUT /v1/autoedit/workflow/{id}/analysis
+    4. **Procesar a blocks** - POST /v1/autoedit/workflow/{id}/process
+    5. **Generar preview** - POST /v1/autoedit/workflow/{id}/preview
+    6. **HITL 2: Revisar preview** - GET /v1/autoedit/workflow/{id}/preview
+    7. **Modificar blocks** (opcional) - PATCH /v1/autoedit/workflow/{id}/blocks
+    8. **Render final** - POST /v1/autoedit/workflow/{id}/render
+    9. **Obtener resultado** - GET /v1/autoedit/workflow/{id}/result
+
+    ## Autenticación
+
+    Todas las peticiones requieren el header `X-API-Key`.
+
+  version: 1.0.0
+  contact:
+    name: NCA Toolkit Support
+  license:
+    name: GPL-2.0
+    url: https://www.gnu.org/licenses/gpl-2.0.html
+
+servers:
+  - url: https://nca-toolkit-djwypu7xmq-uc.a.run.app
+    description: Production (GCP Cloud Run)
+  - url: http://localhost:8080
+    description: Local Development
+
+tags:
+  - name: Workflow Lifecycle
+    description: Crear, obtener y eliminar workflows
+  - name: HITL 1
+    description: Human-in-the-Loop 1 - Revisión de XML
+  - name: HITL 2
+    description: Human-in-the-Loop 2 - Preview y modificación de blocks
+  - name: Render
+    description: Render final y resultado
+
+paths:
+  # =============================================================================
+  # WORKFLOW LIFECYCLE
+  # =============================================================================
+  /v1/autoedit/workflow:
+    post:
+      tags:
+        - Workflow Lifecycle
+      summary: Crear workflow
+      description: |
+        Crea un nuevo workflow de AutoEdit para un video.
+
+        El workflow inicia en estado `created` y automáticamente
+        progresa a través de `transcribing` → `transcribed` → `analyzing` → `pending_review_1`.
+      operationId: createWorkflow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkflowRequest'
+            example:
+              video_url: "https://storage.example.com/video.mp4"
+              options:
+                language: "es"
+                style: "dynamic"
+                skip_hitl_1: false
+                skip_hitl_2: false
+      responses:
+        '201':
+          description: Workflow creado exitosamente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateWorkflowResponse'
+              example:
+                workflow_id: "abc123-def456-ghi789"
+                status: "created"
+                status_message: "Workflow creado"
+                message: "Workflow created successfully"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/autoedit/workflow/{workflow_id}:
+    get:
+      tags:
+        - Workflow Lifecycle
+      summary: Obtener estado del workflow
+      description: |
+        Obtiene el estado actual y datos del workflow.
+
+        La respuesta incluye diferentes campos según el estado actual.
+      operationId: getWorkflowStatus
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          description: Estado del workflow
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowStatusResponse'
+              examples:
+                pending_review_1:
+                  summary: Estado pending_review_1
+                  value:
+                    workflow_id: "abc123"
+                    status: "pending_review_1"
+                    status_message: "HITL 1: Esperando revisión de XML"
+                    created_at: "2025-01-15T10:30:00Z"
+                    updated_at: "2025-01-15T10:31:30Z"
+                    video_url: "https://storage.example.com/video.mp4"
+                    has_transcript: true
+                    has_xml: true
+                pending_review_2:
+                  summary: Estado pending_review_2
+                  value:
+                    workflow_id: "abc123"
+                    status: "pending_review_2"
+                    status_message: "HITL 2: Preview listo, esperando aprobación"
+                    has_blocks: true
+                    block_count: 15
+                    preview_url: "https://storage.example.com/preview.mp4"
+                    preview_duration_ms: 27340
+                    stats:
+                      original_duration_ms: 180000
+                      result_duration_ms: 27340
+                      removed_duration_ms: 152660
+                      removal_percentage: 84.8
+                completed:
+                  summary: Estado completed
+                  value:
+                    workflow_id: "abc123"
+                    status: "completed"
+                    status_message: "Video final listo"
+                    output_url: "https://storage.example.com/output.mp4"
+                    output_duration_ms: 27340
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags:
+        - Workflow Lifecycle
+      summary: Eliminar workflow
+      description: Elimina un workflow y todos sus datos asociados.
+      operationId: deleteWorkflow
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          description: Workflow eliminado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Workflow deleted successfully"
+                  workflow_id:
+                    type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/autoedit/workflows:
+    get:
+      tags:
+        - Workflow Lifecycle
+      summary: Listar workflows
+      description: Lista todos los workflows, opcionalmente filtrados por estado.
+      operationId: listWorkflows
+      parameters:
+        - name: status
+          in: query
+          description: Filtrar por estado del workflow
+          schema:
+            $ref: '#/components/schemas/WorkflowStatus'
+      responses:
+        '200':
+          description: Lista de workflows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListWorkflowsResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # =============================================================================
+  # HITL 1: XML REVIEW
+  # =============================================================================
+  /v1/autoedit/workflow/{workflow_id}/analysis:
+    get:
+      tags:
+        - HITL 1
+      summary: Obtener análisis para revisión
+      description: |
+        Obtiene el XML de análisis de Gemini para revisión del usuario.
+
+        El XML contiene tags `<mantener>` y `<eliminar>` que el usuario
+        puede modificar antes de aprobar.
+
+        **Disponible en estados:** `pending_review_1`, `xml_approved`
+      operationId: getAnalysisForReview
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          description: Análisis para revisión
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisResponse'
+              example:
+                workflow_id: "abc123"
+                status: "pending_review_1"
+                combined_xml: "<resultado><mantener>hola bienvenidos</mantener><eliminar>eh um</eliminar><mantener>al video de hoy</mantener></resultado>"
+                transcript_text: "hola bienvenidos eh um al video de hoy"
+                message: "Review the XML and submit modifications via PUT"
+        '400':
+          description: Estado inválido
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Analysis not available. Workflow status is 'transcribing'. Expected 'pending_review_1'."
+                workflow_id: "abc123"
+                current_status: "transcribing"
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags:
+        - HITL 1
+      summary: Enviar XML revisado
+      description: |
+        Envía el XML modificado por el usuario después de la revisión HITL 1.
+
+        El XML debe contener el elemento raíz `<resultado>` con tags
+        `<mantener>` y `<eliminar>`.
+
+        **Disponible en estados:** `pending_review_1`, `xml_approved`
+      operationId: submitReviewedXml
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitXmlRequest'
+            example:
+              updated_xml: "<resultado><mantener>hola bienvenidos al video de hoy</mantener></resultado>"
+      responses:
+        '200':
+          description: XML aprobado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  workflow_id:
+                    type: string
+                  status:
+                    type: string
+                    example: "xml_approved"
+                  message:
+                    type: string
+              example:
+                workflow_id: "abc123"
+                status: "xml_approved"
+                message: "XML approved. Ready for processing to blocks."
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # =============================================================================
+  # PROCESSING
+  # =============================================================================
+  /v1/autoedit/workflow/{workflow_id}/process:
+    post:
+      tags:
+        - HITL 2
+      summary: Procesar XML a blocks
+      description: |
+        Procesa el XML aprobado para generar blocks con timestamps.
+
+        Utiliza el unified-processor para mapear las decisiones de texto
+        a timestamps precisos mediante neighbor matching.
+
+        **Disponible en estados:** `xml_approved`, `pending_review_1`
+      operationId: processToBlocks
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProcessRequest'
+            example:
+              config:
+                padding_before_ms: 90
+                padding_after_ms: 130
+                silence_threshold_ms: 50
+                merge_threshold_ms: 100
+      responses:
+        '200':
+          description: Blocks generados
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # =============================================================================
+  # HITL 2: PREVIEW
+  # =============================================================================
+  /v1/autoedit/workflow/{workflow_id}/preview:
+    post:
+      tags:
+        - HITL 2
+      summary: Generar preview
+      description: |
+        Genera un video preview de baja resolución (480p) para revisión.
+
+        El preview incluye crossfades entre segmentos para mostrar
+        el resultado final esperado.
+
+        **Disponible en estados:** `generating_preview`, `pending_review_2`,
+        `modifying_blocks`, `regenerating_preview`
+      operationId: generatePreview
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GeneratePreviewRequest'
+            example:
+              quality: "480p"
+              fade_duration: 0.025
+      responses:
+        '200':
+          description: Preview generado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreviewResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      tags:
+        - HITL 2
+      summary: Obtener preview y datos
+      description: |
+        Obtiene el preview actual junto con blocks, gaps y estadísticas.
+
+        **Disponible cuando:** preview_url existe en el workflow
+      operationId: getPreview
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          description: Preview y datos
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreviewResponse'
+              example:
+                workflow_id: "abc123"
+                status: "pending_review_2"
+                preview_url: "https://storage.example.com/preview_480p.mp4"
+                preview_duration_ms: 27340
+                blocks:
+                  - id: "b1"
+                    inMs: 300
+                    outMs: 5720
+                    text: "hola bienvenidos al video de hoy"
+                    preview_inMs: 0
+                  - id: "b2"
+                    inMs: 7220
+                    outMs: 15000
+                    text: "vamos a ver este tema interesante"
+                    preview_inMs: 5420
+                gaps:
+                  - id: "g1"
+                    inMs: 0
+                    outMs: 300
+                    reason: "silence"
+                  - id: "g2"
+                    inMs: 5720
+                    outMs: 7220
+                    reason: "filler_words"
+                    text: "eh bueno um"
+                video_duration_ms: 180000
+                stats:
+                  original_duration_ms: 180000
+                  result_duration_ms: 27340
+                  removed_duration_ms: 152660
+                  removal_percentage: 84.8
+        '400':
+          description: Preview no disponible
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/autoedit/workflow/{workflow_id}/blocks:
+    patch:
+      tags:
+        - HITL 2
+      summary: Modificar blocks
+      description: |
+        Modifica los blocks del timeline (ajustar, dividir, unir, eliminar, restaurar).
+
+        Después de modificar, el frontend debe regenerar el preview
+        para ver los cambios.
+
+        **Disponible en estados:** `pending_review_2`, `modifying_blocks`,
+        `regenerating_preview`
+
+        ## Acciones disponibles
+
+        | Acción | Descripción | Parámetros requeridos |
+        |--------|-------------|-----------------------|
+        | `adjust` | Cambiar timestamps | `block_id`, `new_inMs`, `new_outMs` |
+        | `split` | Dividir en dos | `block_id`, `split_at_ms` |
+        | `merge` | Unir blocks | `block_ids` (array) |
+        | `delete` | Eliminar block | `block_id` |
+        | `restore_gap` | Restaurar gap | `gap_id` o `gap_index` |
+      operationId: modifyBlocks
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModifyBlocksRequest'
+            examples:
+              adjust:
+                summary: Ajustar timestamps
+                value:
+                  modifications:
+                    - action: "adjust"
+                      block_id: "b1"
+                      new_inMs: 350
+                      new_outMs: 5800
+              split:
+                summary: Dividir block
+                value:
+                  modifications:
+                    - action: "split"
+                      block_id: "b2"
+                      split_at_ms: 3000
+              merge:
+                summary: Unir blocks
+                value:
+                  modifications:
+                    - action: "merge"
+                      block_ids: ["b3", "b4"]
+              delete:
+                summary: Eliminar block
+                value:
+                  modifications:
+                    - action: "delete"
+                      block_id: "b5"
+              restore_gap:
+                summary: Restaurar gap eliminado
+                value:
+                  modifications:
+                    - action: "restore_gap"
+                      gap_id: "g2"
+      responses:
+        '200':
+          description: Blocks modificados
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModifyBlocksResponse'
+              example:
+                workflow_id: "abc123"
+                blocks:
+                  - id: "b1"
+                    inMs: 350
+                    outMs: 5800
+                    text: "hola bienvenidos al video de hoy"
+                gaps:
+                  - id: "g1"
+                    inMs: 0
+                    outMs: 350
+                    reason: "silence"
+                stats:
+                  original_duration_ms: 180000
+                  result_duration_ms: 27000
+                needs_preview_regeneration: true
+                message: "Blocks modified. Regenerate preview to see changes."
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # =============================================================================
+  # RENDER
+  # =============================================================================
+  /v1/autoedit/workflow/{workflow_id}/render:
+    post:
+      tags:
+        - Render
+      summary: Aprobar y renderizar
+      description: |
+        Aprueba los blocks finales e inicia el render de alta calidad.
+
+        **Disponible en estados:** `pending_review_2`, `modifying_blocks`,
+        `regenerating_preview`, `blocks_approved`
+      operationId: approveAndRender
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenderRequest'
+            example:
+              quality: "high"
+              crossfade_duration: 0.025
+      responses:
+        '200':
+          description: Render iniciado o completado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RenderResponse'
+              example:
+                workflow_id: "abc123"
+                status: "completed"
+                output_url: "https://storage.example.com/output.mp4"
+                output_duration_ms: 27340
+                stats:
+                  render_time_sec: 45.2
+                  original_duration_ms: 180000
+                  result_duration_ms: 27340
+                message: "Final render complete"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      tags:
+        - Render
+      summary: Obtener estado del render
+      description: Obtiene el progreso actual del render.
+      operationId: getRenderStatus
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          description: Estado del render
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RenderStatusResponse'
+              examples:
+                rendering:
+                  summary: Renderizando
+                  value:
+                    workflow_id: "abc123"
+                    status: "rendering"
+                    progress_percent: 45
+                    message: "Rendering in progress..."
+                completed:
+                  summary: Completado
+                  value:
+                    workflow_id: "abc123"
+                    status: "completed"
+                    output_url: "https://storage.example.com/output.mp4"
+                    output_duration_ms: 27340
+                    stats:
+                      render_time_sec: 45.2
+                    message: "Render complete"
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/autoedit/workflow/{workflow_id}/result:
+    get:
+      tags:
+        - Render
+      summary: Obtener resultado final
+      description: |
+        Obtiene el video final renderizado.
+
+        **Disponible en estados:** `completed`
+      operationId: getResult
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          description: Resultado final
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultResponse'
+              example:
+                workflow_id: "abc123"
+                status: "completed"
+                output_url: "https://storage.example.com/output.mp4"
+                output_duration_ms: 27340
+                video_url: "https://storage.example.com/original.mp4"
+                stats:
+                  original_duration_ms: 180000
+                  result_duration_ms: 27340
+                  removed_duration_ms: 152660
+                  removal_percentage: 84.8
+                  render_time_sec: 45.2
+                cuts:
+                  - start: "0.3"
+                    end: "5.72"
+                  - start: "7.22"
+                    end: "15.0"
+                created_at: "2025-01-15T10:30:00Z"
+                updated_at: "2025-01-15T10:35:00Z"
+        '400':
+          description: Workflow no completado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/autoedit/workflow/{workflow_id}/rerender:
+    post:
+      tags:
+        - Render
+      summary: Re-renderizar con otra calidad
+      description: |
+        Re-renderiza el video con diferentes ajustes de calidad.
+
+        Usa los blocks ya aprobados sin requerir otra revisión HITL.
+
+        **Disponible en estados:** `completed`, `blocks_approved`, `error`
+      operationId: rerender
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenderRequest'
+            example:
+              quality: "4k"
+              crossfade_duration: 0.025
+      responses:
+        '200':
+          description: Re-render completado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RenderResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/autoedit/workflow/{workflow_id}/estimate:
+    get:
+      tags:
+        - Render
+      summary: Estimar tiempo de render
+      description: Obtiene una estimación del tiempo de render para el workflow.
+      operationId: estimateRender
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+        - name: quality
+          in: query
+          description: Calidad de render
+          schema:
+            $ref: '#/components/schemas/RenderQuality'
+      responses:
+        '200':
+          description: Estimación de tiempo
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EstimateResponse'
+              example:
+                workflow_id: "abc123"
+                block_count: 15
+                estimated_preview_seconds: 12.5
+                estimated_render_seconds:
+                  standard: 35.2
+                  high: 67.8
+                  4k: 142.1
+                recommended_quality: "high"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+# =============================================================================
+# COMPONENTS
+# =============================================================================
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API Key para autenticación
+
+  parameters:
+    WorkflowId:
+      name: workflow_id
+      in: path
+      required: true
+      description: ID único del workflow
+      schema:
+        type: string
+        example: "abc123-def456-ghi789"
+
+  responses:
+    BadRequest:
+      description: Request inválido
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Invalid request payload"
+
+    Unauthorized:
+      description: API Key inválida o faltante
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Invalid or missing API key"
+
+    NotFound:
+      description: Workflow no encontrado
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Workflow not found"
+            workflow_id: "abc123"
+
+    InternalError:
+      description: Error interno del servidor
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Internal server error"
+
+  schemas:
+    # =========================================================================
+    # ENUMS
+    # =========================================================================
+    WorkflowStatus:
+      type: string
+      enum:
+        - created
+        - transcribing
+        - transcribed
+        - analyzing
+        - pending_review_1
+        - xml_approved
+        - processing
+        - generating_preview
+        - pending_review_2
+        - modifying_blocks
+        - regenerating_preview
+        - rendering
+        - completed
+        - error
+      description: |
+        Estados posibles del workflow:
+        - `created` - Workflow recién creado
+        - `transcribing` - Transcribiendo con ElevenLabs
+        - `transcribed` - Transcripción completa
+        - `analyzing` - Analizando con Gemini
+        - `pending_review_1` - HITL 1: Esperando revisión de XML
+        - `xml_approved` - XML aprobado por usuario
+        - `processing` - Mapeando XML a timestamps
+        - `generating_preview` - Generando preview low-res
+        - `pending_review_2` - HITL 2: Preview listo
+        - `modifying_blocks` - Usuario modificando blocks
+        - `regenerating_preview` - Regenerando preview
+        - `rendering` - FFmpeg procesando video final
+        - `completed` - Video final listo
+        - `error` - Error en algún paso
+
+    RenderQuality:
+      type: string
+      enum:
+        - standard
+        - high
+        - 4k
+      description: |
+        Calidad de render:
+        - `standard` - CRF 23, preset medium
+        - `high` - CRF 18, preset slow
+        - `4k` - CRF 16, preset slow
+
+    PreviewQuality:
+      type: string
+      enum:
+        - 480p
+        - 720p
+      default: 480p
+
+    ModificationAction:
+      type: string
+      enum:
+        - adjust
+        - split
+        - merge
+        - delete
+        - restore_gap
+
+    GapReason:
+      type: string
+      enum:
+        - silence
+        - filler_words
+        - user_deleted
+
+    # =========================================================================
+    # REQUEST SCHEMAS
+    # =========================================================================
+    CreateWorkflowRequest:
+      type: object
+      required:
+        - video_url
+      properties:
+        video_url:
+          type: string
+          format: uri
+          description: URL del video a procesar
+        options:
+          type: object
+          properties:
+            language:
+              type: string
+              description: Idioma del video
+              default: "es"
+            style:
+              type: string
+              enum: [dynamic, conservative, aggressive]
+              description: Estilo de edición
+              default: "dynamic"
+            skip_hitl_1:
+              type: boolean
+              description: Saltar revisión de XML
+              default: false
+            skip_hitl_2:
+              type: boolean
+              description: Saltar revisión de preview
+              default: false
+        id:
+          type: string
+          description: ID personalizado (opcional)
+
+    SubmitXmlRequest:
+      type: object
+      required:
+        - updated_xml
+      properties:
+        updated_xml:
+          type: string
+          minLength: 1
+          description: XML actualizado con cambios del usuario
+
+    ProcessRequest:
+      type: object
+      properties:
+        config:
+          type: object
+          properties:
+            padding_before_ms:
+              type: number
+              minimum: 0
+              maximum: 500
+              default: 90
+            padding_after_ms:
+              type: number
+              minimum: 0
+              maximum: 500
+              default: 130
+            silence_threshold_ms:
+              type: number
+              minimum: 0
+              maximum: 500
+              default: 50
+            merge_threshold_ms:
+              type: number
+              minimum: 0
+              maximum: 1000
+              default: 100
+
+    GeneratePreviewRequest:
+      type: object
+      properties:
+        quality:
+          $ref: '#/components/schemas/PreviewQuality'
+        fade_duration:
+          type: number
+          minimum: 0.01
+          maximum: 0.5
+          default: 0.025
+
+    ModifyBlocksRequest:
+      type: object
+      required:
+        - modifications
+      properties:
+        modifications:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Modification'
+
+    Modification:
+      type: object
+      required:
+        - action
+      properties:
+        action:
+          $ref: '#/components/schemas/ModificationAction'
+        block_id:
+          type: string
+          description: ID del block a modificar
+        block_ids:
+          type: array
+          items:
+            type: string
+          description: IDs de blocks a unir (para merge)
+        gap_id:
+          type: string
+          description: ID del gap a restaurar
+        gap_index:
+          type: integer
+          minimum: 0
+          description: Índice del gap a restaurar
+        new_inMs:
+          type: integer
+          minimum: 0
+          description: Nuevo timestamp de inicio
+        new_outMs:
+          type: integer
+          minimum: 0
+          description: Nuevo timestamp de fin
+        split_at_ms:
+          type: integer
+          minimum: 0
+          description: Timestamp donde dividir
+
+    RenderRequest:
+      type: object
+      properties:
+        quality:
+          $ref: '#/components/schemas/RenderQuality'
+        crossfade_duration:
+          type: number
+          minimum: 0.01
+          maximum: 0.5
+          default: 0.025
+
+    # =========================================================================
+    # RESPONSE SCHEMAS
+    # =========================================================================
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Mensaje de error
+        workflow_id:
+          type: string
+        current_status:
+          type: string
+        error_details:
+          type: string
+
+    CreateWorkflowResponse:
+      type: object
+      properties:
+        workflow_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/WorkflowStatus'
+        status_message:
+          type: string
+        message:
+          type: string
+
+    WorkflowStatusResponse:
+      type: object
+      properties:
+        workflow_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/WorkflowStatus'
+        status_message:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        video_url:
+          type: string
+          format: uri
+        options:
+          type: object
+        has_transcript:
+          type: boolean
+        has_xml:
+          type: boolean
+        has_blocks:
+          type: boolean
+        block_count:
+          type: integer
+        preview_url:
+          type: string
+          format: uri
+        preview_duration_ms:
+          type: integer
+        output_url:
+          type: string
+          format: uri
+        output_duration_ms:
+          type: integer
+        error:
+          type: string
+        error_details:
+          type: string
+        stats:
+          $ref: '#/components/schemas/Stats'
+
+    ListWorkflowsResponse:
+      type: object
+      properties:
+        workflows:
+          type: array
+          items:
+            type: object
+            properties:
+              workflow_id:
+                type: string
+              status:
+                $ref: '#/components/schemas/WorkflowStatus'
+              created_at:
+                type: string
+                format: date-time
+              video_url:
+                type: string
+        total:
+          type: integer
+        filter:
+          type: object
+          nullable: true
+
+    AnalysisResponse:
+      type: object
+      properties:
+        workflow_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/WorkflowStatus'
+        combined_xml:
+          type: string
+          description: XML con tags mantener/eliminar
+        transcript_text:
+          type: string
+          description: Texto completo de referencia
+        message:
+          type: string
+
+    ProcessResponse:
+      type: object
+      properties:
+        workflow_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/WorkflowStatus'
+        blocks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Block'
+        gaps:
+          type: array
+          items:
+            $ref: '#/components/schemas/Gap'
+        stats:
+          $ref: '#/components/schemas/Stats'
+        message:
+          type: string
+
+    PreviewResponse:
+      type: object
+      properties:
+        workflow_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/WorkflowStatus'
+        preview_url:
+          type: string
+          format: uri
+        preview_duration_ms:
+          type: integer
+        blocks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Block'
+        gaps:
+          type: array
+          items:
+            $ref: '#/components/schemas/Gap'
+        video_duration_ms:
+          type: integer
+        stats:
+          $ref: '#/components/schemas/Stats'
+        message:
+          type: string
+
+    ModifyBlocksResponse:
+      type: object
+      properties:
+        workflow_id:
+          type: string
+        blocks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Block'
+        gaps:
+          type: array
+          items:
+            $ref: '#/components/schemas/Gap'
+        stats:
+          $ref: '#/components/schemas/Stats'
+        needs_preview_regeneration:
+          type: boolean
+        errors:
+          type: array
+          items:
+            type: string
+          nullable: true
+        message:
+          type: string
+
+    RenderResponse:
+      type: object
+      properties:
+        workflow_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/WorkflowStatus'
+        output_url:
+          type: string
+          format: uri
+        output_duration_ms:
+          type: integer
+        stats:
+          $ref: '#/components/schemas/Stats'
+        message:
+          type: string
+
+    RenderStatusResponse:
+      type: object
+      properties:
+        workflow_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/WorkflowStatus'
+        progress_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+        output_url:
+          type: string
+          format: uri
+        output_duration_ms:
+          type: integer
+        error:
+          type: string
+        error_details:
+          type: string
+        stats:
+          $ref: '#/components/schemas/Stats'
+        message:
+          type: string
+
+    ResultResponse:
+      type: object
+      properties:
+        workflow_id:
+          type: string
+        status:
+          type: string
+          enum: [completed]
+        output_url:
+          type: string
+          format: uri
+        output_duration_ms:
+          type: integer
+        video_url:
+          type: string
+          format: uri
+        stats:
+          $ref: '#/components/schemas/Stats'
+        cuts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Cut'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    EstimateResponse:
+      type: object
+      properties:
+        workflow_id:
+          type: string
+        block_count:
+          type: integer
+        estimated_preview_seconds:
+          type: number
+        estimated_render_seconds:
+          type: object
+          properties:
+            standard:
+              type: number
+            high:
+              type: number
+            4k:
+              type: number
+        recommended_quality:
+          $ref: '#/components/schemas/RenderQuality'
+
+    # =========================================================================
+    # DATA SCHEMAS
+    # =========================================================================
+    Block:
+      type: object
+      description: Segmento de video a mantener
+      properties:
+        id:
+          type: string
+          description: ID único del block
+        inMs:
+          type: integer
+          description: Timestamp de inicio (ms) en video original
+        outMs:
+          type: integer
+          description: Timestamp de fin (ms) en video original
+        text:
+          type: string
+          description: Texto del segmento
+        preview_inMs:
+          type: integer
+          description: Posición en el video preview (ms)
+
+    Gap:
+      type: object
+      description: Segmento de video eliminado
+      properties:
+        id:
+          type: string
+          description: ID único del gap
+        inMs:
+          type: integer
+          description: Timestamp de inicio (ms)
+        outMs:
+          type: integer
+          description: Timestamp de fin (ms)
+        reason:
+          $ref: '#/components/schemas/GapReason'
+        text:
+          type: string
+          description: Texto del segmento (si aplica)
+          nullable: true
+
+    Cut:
+      type: object
+      description: Punto de corte para FFmpeg
+      properties:
+        start:
+          type: string
+          description: Tiempo de inicio (segundos)
+        end:
+          type: string
+          description: Tiempo de fin (segundos)
+
+    Stats:
+      type: object
+      description: Estadísticas del workflow
+      properties:
+        original_duration_ms:
+          type: integer
+          description: Duración original del video (ms)
+        result_duration_ms:
+          type: integer
+          description: Duración del resultado (ms)
+        removed_duration_ms:
+          type: integer
+          description: Duración removida (ms)
+        removal_percentage:
+          type: number
+          format: float
+          description: Porcentaje de video removido
+        total_blocks:
+          type: integer
+        total_gaps:
+          type: integer
+        render_time_sec:
+          type: number
+          format: float
+          description: Tiempo de render (segundos)
+
+security:
+  - ApiKeyAuth: []
