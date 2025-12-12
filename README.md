@@ -83,6 +83,14 @@ Each endpoint is supported by robust payload validation and detailed API documen
 - **[`/v1/media/metadata`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/media/metadata.md)**
   - Extracts comprehensive metadata from media files including format, codecs, resolution, and bitrates.
 
+### GCP (Google Cloud Platform)
+
+- **[`/v1/gcp/upload`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/gcp/upload.md)**
+  - Streams a file from a URL directly to Google Cloud Storage without using local disk space.
+
+- **[`/v1/gcp/signed-upload-url`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/gcp/signed-url.md)**
+  - Generates signed URLs for direct browser-to-GCS uploads, enabling frontend applications to upload files directly.
+
 ### S3
 
 - **[`/v1/s3/upload`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/s3/upload.md)**
@@ -101,6 +109,22 @@ Each endpoint is supported by robust payload validation and detailed API documen
 
 - **[`/v1/toolkit/jobs/status`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/toolkit/jobs_status.md)**
   - Retrieves the status of all jobs within a specified time range.
+
+### Transcription (Media Gateway Integration)
+
+- **[`/v1/transcription/process`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/transcription/process.md)**
+  - Processes transcriptions with timestamps and cuts. Migrated from Media Processing Gateway.
+
+- **[`/v1/transcription/xml-processor`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/transcription/xml-processor.md)**
+  - Processes XML with `<mantener>` tags and finds corresponding segments in transcript with timestamps.
+
+- **[`/v1/transcription/unified-processor`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/transcription/unified-processor.md)**
+  - Unified processor that combines XML processing and transcription processing in a single call.
+
+### Scenes
+
+- **[`/v1/scenes/replace-ids`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/scenes/replace-ids.md)**
+  - Replaces scene IDs in JSON according to a mapping. Migrated from Media Processing Gateway.
 
 ### Video
 
@@ -121,6 +145,32 @@ Each endpoint is supported by robust payload validation and detailed API documen
 
 - **[`/v1/video/trim`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/video/trim.md)**
   - Trims a video by keeping only the content between specified start and end times.
+
+### AutoEdit (AI-Powered Video Editing)
+
+AutoEdit is an AI-powered automatic video editing pipeline that uses transcription and LLM analysis to remove filler words, silences, and unwanted content.
+
+- **[`/v1/autoedit/workflow`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/autoedit/API-REFERENCE.md)**
+  - Create and manage AutoEdit workflows for AI-powered video editing.
+
+- **[`/v1/autoedit/upload`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/autoedit/API-REFERENCE.md)**
+  - Upload video files for AutoEdit processing.
+
+- **[`/v1/autoedit/analyze`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/autoedit/API-REFERENCE.md)**
+  - Analyze transcription with Gemini AI to identify content to keep/remove.
+
+- **[`/v1/autoedit/process`](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/autoedit/API-REFERENCE.md)**
+  - Process analyzed content to generate video cuts with timestamps.
+
+See the [AutoEdit API Reference](https://github.com/stephengpope/no-code-architects-toolkit/blob/main/docs/autoedit/API-REFERENCE.md) for complete documentation including workflow states, HITL (Human-in-the-Loop) review, and render options.
+
+### Logic (AI Decision Processing)
+
+- **`/v1/logic/prepare-prompt`**
+  - Prepares transcript blocks for AI analysis with configurable block sizes and formatting.
+
+- **`/v1/logic/parse-ai-decision`**
+  - Parses AI decision output and extracts structured results from LLM responses.
 
 ---
 

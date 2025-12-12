@@ -240,6 +240,99 @@ See [docs/adding_routes.md](docs/adding_routes.md) for full guide.
 - Update README.md when adding new endpoints
 - Follow GPL-2.0 license (see [LICENSE](LICENSE))
 
+## GCP Endpoints
+
+### Signed URLs for Direct Upload
+
+The `/v1/gcp/signed-upload-url` endpoint generates V4 signed URLs for direct browser-to-GCS uploads:
+
+```python
+# Route: routes/v1/gcp/signed_upload_url.py
+# Service: services/v1/gcp/signed_url.py
+
+# Usage:
+POST /v1/gcp/signed-upload-url
+{
+  "filename": "video.mp4",
+  "content_type": "video/mp4",
+  "folder": "uploads/user123"  # optional
+}
+
+# Response includes upload_url for PUT and public_url for access
+```
+
+This enables the frontend upload flow:
+1. Frontend requests signed URL from NCA Toolkit
+2. Frontend PUTs file directly to GCS using signed URL
+3. Frontend uses public_url for subsequent API calls (e.g., create workflow)
+
+Documentation: [docs/gcp/signed-url.md](docs/gcp/signed-url.md)
+
+### Stream Upload
+
+The `/v1/gcp/upload` endpoint streams files from a URL directly to GCS without local storage.
+
+Documentation: [docs/gcp/upload.md](docs/gcp/upload.md)
+
+---
+
+## AutoEdit Pipeline
+
+AutoEdit is a video editing pipeline with AI-powered content analysis and two Human-in-the-Loop (HITL) review points.
+
+### Architecture
+
+```
+routes/v1/autoedit/
+├── workflow_api.py      # Workflow lifecycle + HITL 1 (XML review)
+├── preview_api.py       # HITL 2 (preview generation + block modification)
+└── render_api.py        # Final render + result endpoints
+
+services/v1/autoedit/
+├── workflow.py          # State machine (file-based, optional Redis)
+├── blocks.py            # Block manipulation (adjust, split, merge, delete)
+├── preview.py           # Preview/render generation via FFmpeg
+└── ffmpeg_builder.py    # FFmpeg payload construction with crossfade
+```
+
+### Workflow States
+
+```
+created → transcribing → transcribed → analyzing → pending_review_1
+                                                          │
+                                                    [HITL 1: XML Review]
+                                                          │
+                                                    xml_approved → processing
+                                                                       │
+                                                              generating_preview
+                                                                       │
+                                                    [HITL 2: Preview Review]
+                                                                       │
+                        pending_review_2 ←→ modifying_blocks ←→ regenerating_preview
+                                    │
+                              rendering → completed
+```
+
+### Key Patterns
+
+**FFmpeg Crossfade**: Uses separate video/audio inputs to handle complex crossfade operations. See `services/v1/autoedit/ffmpeg_builder.py:build_ffmpeg_compose_payload()`.
+
+**Render Profiles** (in `ffmpeg_builder.py`):
+- `preview`: 480p, CRF 30, ultrafast preset
+- `standard`: Original resolution, CRF 23, medium preset
+- `high`: Original resolution, CRF 18, slow preset
+- `4k`: Original resolution, CRF 16, slow preset
+
+**Workflow Storage**: JSON files in `{LOCAL_STORAGE_PATH}/workflows/` with 24h TTL.
+
+### Documentation
+
+- API Reference: [docs/autoedit/API-REFERENCE.md](docs/autoedit/API-REFERENCE.md)
+- Frontend Guide: [docs/autoedit/FRONTEND-GUIDE.md](docs/autoedit/FRONTEND-GUIDE.md)
+- Workflow States: [docs/autoedit/WORKFLOW-STATES.md](docs/autoedit/WORKFLOW-STATES.md)
+- MCP Integration: [docs/autoedit/MCP-INTEGRATION.md](docs/autoedit/MCP-INTEGRATION.md)
+- OpenAPI Spec: [openapi/autoedit.yaml](openapi/autoedit.yaml)
+
 ## Deployment Guides
 
 - Digital Ocean App Platform: [docs/cloud-installation/do.md](docs/cloud-installation/do.md)

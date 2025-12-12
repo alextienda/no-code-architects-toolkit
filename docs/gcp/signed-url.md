@@ -144,6 +144,8 @@ Frontend                         NCA Toolkit                      GCS
 
 ## POST /v1/gcp/signed-download-url
 
+> **Nota**: Este endpoint está planificado pero aún no implementado. La función de servicio está disponible en `services/v1/gcp/signed_url.py`.
+
 Genera una URL firmada para descargar archivos privados de GCS.
 
 ### Request
