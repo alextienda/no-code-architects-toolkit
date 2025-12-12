@@ -5,9 +5,6 @@
 # the Free Software Foundation; either version 2 of the License, or
 # (at your option) any later version.
 
-import sys
-print(f"DEBUG: signed_upload_url.py being imported", file=sys.stderr)
-
 from flask import Blueprint
 from services.authentication import authenticate
 from app_utils import validate_payload, queue_task_wrapper
