@@ -1,0 +1,436 @@
+# AutoEdit Workflow - Arquitectura Modular
+#
+# Este workflow implementa el pipeline AutoEdit con llamadas directas a:
+# - ElevenLabs: Transcripcion word-level
+# - Gemini (Vertex AI): Analisis de contenido
+# - NCA Toolkit: Procesamiento de cortes y video
+#
+# Soporta dos rutas:
+# - Ruta A (auto): Procesamiento automatico completo
+# - Ruta B (human): Retorna datos para revision en frontend
+#
+# Uso:
+#   gcloud workflows deploy autoedit-modular \
+#     --location=us-central1 \
+#     --source=autoedit-workflow-modular.yaml
+#
+# Ejecucion:
+#   gcloud workflows run autoedit-modular \
+#     --data='{"video_url":"gs://bucket/video.mp4","route":"auto"}'
+
+main:
+  params: [input]
+  steps:
+    # =========================================================================
+    # PASO 1: Inicializacion y Validacion
+    # =========================================================================
+    - init:
+        assign:
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - location: "us-central1"
+          - video_url: ${input.video_url}
+          - route: ${default(input.route, "auto")}
+          - webhook_url: ${default(input.webhook_url, "")}
+          - session_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+          # Configuracion de procesamiento
+          - config:
+              silence_threshold: ${default(input.config.silence_threshold, 1000)}
+              padding_before: ${default(input.config.padding_before, 90)}
+              padding_after: ${default(input.config.padding_after, 90)}
+              merge_threshold: ${default(input.config.merge_threshold, 100)}
+          # URLs de servicios (configurar como secrets en produccion)
+          - elevenlabs_api_key: ${sys.get_env("ELEVENLABS_API_KEY")}
+          - nca_toolkit_url: ${sys.get_env("NCA_TOOLKIT_URL")}
+          - nca_api_key: ${sys.get_env("NCA_API_KEY")}
+
+    # =========================================================================
+    # PASO 2: Descargar audio del video (GCS -> URL temporal)
+    # =========================================================================
+    - get_audio_url:
+        call: googleapis.storage.v1.objects.get
+        args:
+          bucket: ${text.split(video_url, "/")[2]}
+          object: ${text.url_encode(text.substring(video_url, len("gs://" + text.split(video_url, "/")[2] + "/"), len(video_url)))}
+          alt: "media"
+        result: audio_content
+
+    # =========================================================================
+    # PASO 3: Transcripcion con ElevenLabs (LLAMADA DIRECTA)
+    # =========================================================================
+    - transcribe_elevenlabs:
+        call: http.post
+        args:
+          url: "https://api.elevenlabs.io/v1/speech-to-text"
+          headers:
+            xi-api-key: ${elevenlabs_api_key}
+          body:
+            model_id: "scribe_v1"
+            audio_url: ${video_url}  # ElevenLabs acepta URLs de GCS con acceso publico
+            timestamps_granularity: "word"
+            diarize: true
+            tag_audio_events: true
+            num_speakers: 4
+        result: elevenlabs_response
+
+    # =========================================================================
+    # PASO 4: Transformar respuesta ElevenLabs a formato interno
+    # =========================================================================
+    - transform_transcript:
+        call: transform_elevenlabs_output
+        args:
+          elevenlabs_data: ${elevenlabs_response.body}
+        result: transcript_data
+
+    # =========================================================================
+    # PASO 5: Preparar bloques para Gemini
+    # =========================================================================
+    - prepare_gemini_blocks:
+        call: prepare_blocks_for_gemini
+        args:
+          transcript: ${transcript_data.transcript}
+          max_block_duration_ms: 60000
+        result: gemini_input
+
+    # =========================================================================
+    # PASO 6: Analisis con Gemini (LLAMADA DIRECTA via Vertex AI)
+    # =========================================================================
+    - analyze_with_gemini:
+        call: http.post
+        args:
+          url: ${"https://" + location + "-aiplatform.googleapis.com/v1/projects/" + project_id + "/locations/" + location + "/publishers/google/models/gemini-2.0-flash-exp:generateContent"}
+          auth:
+            type: OAuth2
+          body:
+            contents:
+              - role: "user"
+                parts:
+                  - text: ${gemini_input.formatted_text}
+            systemInstruction:
+              parts:
+                - text: ${sys.get_env("GEMINI_SYSTEM_PROMPT")}
+            generationConfig:
+              temperature: 0.0
+              responseMimeType: "application/json"
+        result: gemini_response
+
+    # =========================================================================
+    # PASO 7: Parsear respuesta de Gemini
+    # =========================================================================
+    - parse_gemini_output:
+        assign:
+          - gemini_blocks: ${json.decode(gemini_response.body.candidates[0].content.parts[0].text)}
+
+    # =========================================================================
+    # PASO 8: Router - Elegir ruta segun parametro
+    # =========================================================================
+    - route_decision:
+        switch:
+          - condition: ${route == "human"}
+            next: route_human
+          - condition: ${route == "auto"}
+            next: route_auto
+        next: route_auto
+
+    # =========================================================================
+    # RUTA B: Human-in-the-Loop
+    # =========================================================================
+    - route_human:
+        steps:
+          - map_actions_to_transcript:
+              call: map_gemini_to_transcript
+              args:
+                transcript: ${transcript_data.transcript}
+                gemini_blocks: ${gemini_blocks}
+              result: transcript_with_actions
+
+          - return_for_review:
+              return:
+                status: "pending_review"
+                session_id: ${session_id}
+                video_url: ${video_url}
+                transcript: ${transcript_with_actions}
+                gemini_blocks: ${gemini_blocks}
+                total_duration_ms: ${transcript_data.total_duration_ms}
+                config: ${config}
+
+    # =========================================================================
+    # RUTA A: Automatica
+    # =========================================================================
+    - route_auto:
+        steps:
+          # Combinar XMLs de Gemini
+          - combine_xml:
+              call: combine_gemini_outputs
+              args:
+                gemini_blocks: ${gemini_blocks}
+              result: combined_xml
+
+          # Llamar NCA Toolkit: xml-processor
+          - call_xml_processor:
+              call: http.post
+              args:
+                url: ${nca_toolkit_url + "/v1/transcription/xml-processor"}
+                headers:
+                  X-API-Key: ${nca_api_key}
+                  Content-Type: "application/json"
+                body:
+                  xml_string: ${combined_xml}
+                  transcript: ${transcript_data.transcript}
+              result: xml_processor_response
+
+          # Llamar NCA Toolkit: process
+          - call_process:
+              call: http.post
+              args:
+                url: ${nca_toolkit_url + "/v1/transcription/process"}
+                headers:
+                  X-API-Key: ${nca_api_key}
+                  Content-Type: "application/json"
+                body:
+                  input_transcription: ${combined_xml}
+                  input_agent_data: ${xml_processor_response.body.response}
+                  config: ${config}
+              result: process_response
+
+          # Convertir blocks a cuts
+          - convert_to_cuts:
+              call: blocks_to_cuts
+              args:
+                blocks: ${process_response.body.response.blocks}
+              result: cuts
+
+          # Llamar NCA Toolkit: video/cut
+          - call_video_cut:
+              call: http.post
+              args:
+                url: ${nca_toolkit_url + "/v1/video/cut"}
+                headers:
+                  X-API-Key: ${nca_api_key}
+                  Content-Type: "application/json"
+                body:
+                  video_url: ${video_url}
+                  cuts: ${cuts}
+                timeout: 600
+              result: video_cut_response
+
+          # Retornar resultado
+          - return_auto_result:
+              return:
+                status: "completed"
+                session_id: ${session_id}
+                video_url: ${video_url}
+                edited_video_url: ${video_cut_response.body.response}
+                stats:
+                  original_words: ${len(transcript_data.transcript)}
+                  cuts_generated: ${len(cuts)}
+                  config_used: ${config}
+
+    # =========================================================================
+    # PASO FINAL: Enviar webhook si existe
+    # =========================================================================
+    - send_webhook:
+        switch:
+          - condition: ${webhook_url != ""}
+            steps:
+              - post_webhook:
+                  call: http.post
+                  args:
+                    url: ${webhook_url}
+                    body: ${result}
+                  result: webhook_result
+
+    - done:
+        return: ${result}
+
+# =============================================================================
+# SUBWORKFLOWS
+# =============================================================================
+
+# Transforma respuesta de ElevenLabs a formato interno con milisegundos
+transform_elevenlabs_output:
+  params: [elevenlabs_data]
+  steps:
+    - process:
+        assign:
+          - transcript: []
+          - num_id: 0
+          - total_duration_ms: 0
+
+    - iterate_words:
+        for:
+          value: word
+          in: ${elevenlabs_data.words}
+          steps:
+            - check_type:
+                switch:
+                  - condition: ${word.type == "word" or word.type == "audio_event"}
+                    steps:
+                      - add_word:
+                          assign:
+                            - transcript: ${list.concat(transcript, [{
+                                "NumID": num_id,
+                                "text": word.text,
+                                "inMs": int(word.start * 1000),
+                                "outMs": int(word.end * 1000),
+                                "speaker_id": default(word.speaker_id, null)
+                              }])}
+                            - num_id: ${num_id + 1}
+                            - total_duration_ms: ${int(word.end * 1000)}
+
+    - return_result:
+        return:
+          transcript: ${transcript}
+          total_duration_ms: ${total_duration_ms}
+          full_text: ${elevenlabs_data.text}
+
+# Prepara bloques de texto para enviar a Gemini
+prepare_blocks_for_gemini:
+  params: [transcript, max_block_duration_ms]
+  steps:
+    - init:
+        assign:
+          - blocks: []
+          - current_block_id: 0
+          - current_text: []
+          - current_start_ms: 0
+
+    - iterate_transcript:
+        for:
+          value: word
+          in: ${transcript}
+          steps:
+            - check_new_block:
+                switch:
+                  - condition: ${word.outMs - current_start_ms > max_block_duration_ms and len(current_text) > 0}
+                    steps:
+                      - finalize_block:
+                          assign:
+                            - blocks: ${list.concat(blocks, [{
+                                "blockID": string(current_block_id),
+                                "text": text.join(current_text, " ")
+                              }])}
+                            - current_block_id: ${current_block_id + 1}
+                            - current_text: [word.text]
+                            - current_start_ms: ${word.inMs}
+                  - condition: true
+                    assign:
+                      - current_text: ${list.concat(current_text, [word.text])}
+
+    - finalize_last_block:
+        switch:
+          - condition: ${len(current_text) > 0}
+            assign:
+              - blocks: ${list.concat(blocks, [{
+                  "blockID": string(current_block_id),
+                  "text": text.join(current_text, " ")
+                }])}
+
+    - format_text:
+        assign:
+          - formatted_lines: []
+
+    - build_formatted_text:
+        for:
+          value: block
+          in: ${blocks}
+          steps:
+            - add_line:
+                assign:
+                  - formatted_lines: ${list.concat(formatted_lines, [block.blockID + ": " + block.text])}
+
+    - return_result:
+        return:
+          blocks: ${blocks}
+          formatted_text: ${text.join(formatted_lines, "\n")}
+
+# Combina outputs XML de Gemini en un solo string
+combine_gemini_outputs:
+  params: [gemini_blocks]
+  steps:
+    - init:
+        assign:
+          - xml_parts: []
+
+    - iterate_blocks:
+        for:
+          value: block
+          in: ${gemini_blocks}
+          steps:
+            - add_xml:
+                assign:
+                  - xml_parts: ${list.concat(xml_parts, [block.outputXML])}
+
+    - return_result:
+        return: ${text.join(xml_parts, "")}
+
+# Convierte blocks (inMs/outMs) a cuts (start/end en segundos)
+blocks_to_cuts:
+  params: [blocks]
+  steps:
+    - init:
+        assign:
+          - cuts: []
+
+    - iterate_blocks:
+        for:
+          value: block
+          in: ${blocks}
+          steps:
+            - add_cut:
+                assign:
+                  - cuts: ${list.concat(cuts, [{
+                      "start": block.inMs / 1000,
+                      "end": block.outMs / 1000
+                    }])}
+
+    - return_result:
+        return: ${cuts}
+
+# Mapea decisiones de Gemini al transcript con campo 'action'
+map_gemini_to_transcript:
+  params: [transcript, gemini_blocks]
+  steps:
+    - init:
+        assign:
+          - result: []
+          - word_index: 0
+
+    # Parsear todos los XMLs de Gemini para extraer texto a mantener/eliminar
+    - extract_actions:
+        assign:
+          - keep_words: []
+          - remove_words: []
+
+    - iterate_gemini_blocks:
+        for:
+          value: block
+          in: ${gemini_blocks}
+          steps:
+            - parse_xml:
+                # Extraer palabras de tags <mantener> y <eliminar>
+                # Nota: En produccion, usar una funcion mas robusta de parsing XML
+                assign:
+                  - xml: ${block.outputXML}
+                  # Simplificacion: asumir que todo lo que no esta en <eliminar> se mantiene
+
+    # Asignar action a cada palabra basado en el XML
+    - assign_actions:
+        for:
+          value: word
+          in: ${transcript}
+          steps:
+            - determine_action:
+                assign:
+                  # Por defecto mantener (la logica real debe verificar contra el XML parseado)
+                  - action: "keep"
+                  - result: ${list.concat(result, [{
+                      "NumID": word.NumID,
+                      "text": word.text,
+                      "inMs": word.inMs,
+                      "outMs": word.outMs,
+                      "speaker_id": word.speaker_id,
+                      "action": action
+                    }])}
+
+    - return_result:
+        return: ${result}

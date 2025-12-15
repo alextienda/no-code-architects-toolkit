@@ -1,0 +1,54 @@
+steps:
+  # Build the Docker image (--no-cache to force rebuild)
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--no-cache'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/nca-toolkit:$BUILD_ID'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/nca-toolkit:latest'
+      - '.'
+    timeout: 1200s
+
+  # Push the image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/nca-toolkit:$BUILD_ID'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/nca-toolkit:latest'
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'nca-toolkit'
+      - '--image'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/nca-toolkit:$BUILD_ID'
+      - '--region'
+      - 'us-central1'
+      - '--allow-unauthenticated'
+      - '--memory'
+      - '4Gi'
+      - '--cpu'
+      - '2'
+      - '--timeout'
+      - '3600'
+      - '--set-env-vars'
+      - 'API_KEY=53528a94ca5ba5e12e9a0c95e5be5f9a8140e893b99f8e6b43b11f53d75382f7,GCP_BUCKET_NAME=nca-toolkit-autoedit,CLOUD_TASKS_QUEUE=autoedit-pipeline,SERVICE_URL=https://nca-toolkit-djwypu7xmq-uc.a.run.app,GCP_PROJECT_ID=autoedit-at,GCP_LOCATION=us-central1,ELEVENLABS_API_KEY=sk_fbfe76620fabd0e4b3c5b6ae62439be3c32f291bd2720579,NCA_TOOLKIT_URL=http://127.0.0.1:8080'
+      - '--set-secrets'
+      - 'GCP_SA_CREDENTIALS=nca-toolkit-sa-key:latest'
+      - '--service-account'
+      - 'nca-toolkit-sa@autoedit-at.iam.gserviceaccount.com'
+
+# Global build configuration
+timeout: 1800s
+options:
+  machineType: 'E2_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY

@@ -47,8 +47,8 @@ PROCESS_SCHEMA = {
                 },
                 "gemini_model": {
                     "type": "string",
-                    "enum": ["gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-1.5-pro"],
-                    "default": "gemini-2.0-flash-exp",
+                    "enum": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-1.5-pro"],
+                    "default": "gemini-2.5-pro",
                     "description": "Gemini model to use for analysis"
                 },
                 "gemini_temperature": {

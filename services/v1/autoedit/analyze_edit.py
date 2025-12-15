@@ -15,11 +15,183 @@ and decide what to keep or remove. Output is XML format (<mantener>/<eliminar>).
 import os
 import json
 import logging
+import re
 import requests
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# XML Validation and Repair Functions
+# =============================================================================
+
+def validate_xml_tags(xml: str) -> Tuple[bool, List[str]]:
+    """
+    Validate that all XML tags are properly closed.
+
+    Args:
+        xml: XML string to validate
+
+    Returns:
+        Tuple of (is_valid, list_of_errors)
+    """
+    errors = []
+
+    # Pattern to find opening tags and their content up to the next tag
+    # This catches cases like <eliminar>text</mantener>
+    pattern = r'<(mantener|eliminar)>(.*?)</(mantener|eliminar)>'
+
+    for match in re.finditer(pattern, xml, re.DOTALL):
+        open_tag = match.group(1)
+        close_tag = match.group(3)
+        content = match.group(2)[:50]  # First 50 chars for logging
+
+        if open_tag != close_tag:
+            errors.append(f"Tag mismatch: <{open_tag}> closed with </{close_tag}> (content: '{content}...')")
+
+    # Also check for unclosed tags
+    open_mantener = len(re.findall(r'<mantener>', xml))
+    close_mantener = len(re.findall(r'</mantener>', xml))
+    open_eliminar = len(re.findall(r'<eliminar>', xml))
+    close_eliminar = len(re.findall(r'</eliminar>', xml))
+
+    if open_mantener != close_mantener:
+        errors.append(f"Unbalanced <mantener> tags: {open_mantener} open, {close_mantener} close")
+    if open_eliminar != close_eliminar:
+        errors.append(f"Unbalanced <eliminar> tags: {open_eliminar} open, {close_eliminar} close")
+
+    return len(errors) == 0, errors
+
+
+def repair_xml_tags(xml: str) -> Tuple[str, int]:
+    """
+    Repair XML with mismatched tags by ensuring each opening tag
+    has a matching closing tag.
+
+    Args:
+        xml: XML string with potential tag mismatches
+
+    Returns:
+        Tuple of (repaired_xml, number_of_repairs)
+    """
+    repairs = 0
+
+    # Strategy: Find all tags in order, track state, fix mismatches
+    # We'll process character by character to handle this properly
+
+    result = []
+    i = 0
+    current_tag = None  # Track which tag is currently open
+
+    while i < len(xml):
+        # Check for opening tag
+        mantener_match = xml[i:].startswith('<mantener>')
+        eliminar_match = xml[i:].startswith('<eliminar>')
+
+        if mantener_match:
+            if current_tag is not None:
+                # Previous tag wasn't closed, close it first
+                result.append(f'</{current_tag}>')
+                repairs += 1
+                logger.warning(f"XML repair: Auto-closed unclosed <{current_tag}> tag")
+            current_tag = 'mantener'
+            result.append('<mantener>')
+            i += len('<mantener>')
+            continue
+
+        if eliminar_match:
+            if current_tag is not None:
+                # Previous tag wasn't closed, close it first
+                result.append(f'</{current_tag}>')
+                repairs += 1
+                logger.warning(f"XML repair: Auto-closed unclosed <{current_tag}> tag")
+            current_tag = 'eliminar'
+            result.append('<eliminar>')
+            i += len('<eliminar>')
+            continue
+
+        # Check for closing tags
+        close_mantener = xml[i:].startswith('</mantener>')
+        close_eliminar = xml[i:].startswith('</eliminar>')
+
+        if close_mantener or close_eliminar:
+            expected_close = '</mantener>' if close_mantener else '</eliminar>'
+            actual_tag = 'mantener' if close_mantener else 'eliminar'
+
+            if current_tag is None:
+                # Closing tag without opening - skip it
+                repairs += 1
+                logger.warning(f"XML repair: Removed orphan </{actual_tag}> tag")
+                i += len(expected_close)
+                continue
+
+            if current_tag != actual_tag:
+                # Mismatched closing tag - use the correct one
+                repairs += 1
+                logger.warning(f"XML repair: Changed </{actual_tag}> to </{current_tag}> (was <{current_tag}>...)")
+                result.append(f'</{current_tag}>')
+            else:
+                result.append(expected_close)
+
+            current_tag = None
+            i += len(expected_close)
+            continue
+
+        # Regular character
+        result.append(xml[i])
+        i += 1
+
+    # Close any unclosed tag at the end
+    if current_tag is not None:
+        result.append(f'</{current_tag}>')
+        repairs += 1
+        logger.warning(f"XML repair: Closed unclosed <{current_tag}> at end of XML")
+
+    return ''.join(result), repairs
+
+
+def validate_and_repair_block_xml(block: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validate and repair the outputXML in a block.
+
+    Args:
+        block: Block dict with blockID and outputXML
+
+    Returns:
+        Block with repaired outputXML and validation metadata
+    """
+    block_id = block.get('blockID', 'unknown')
+    output_xml = block.get('outputXML', '')
+
+    # First validate
+    is_valid, errors = validate_xml_tags(output_xml)
+
+    if not is_valid:
+        logger.warning(f"Block {block_id} has malformed XML: {errors}")
+
+        # Attempt repair
+        repaired_xml, repair_count = repair_xml_tags(output_xml)
+
+        # Validate again
+        is_valid_after, remaining_errors = validate_xml_tags(repaired_xml)
+
+        if is_valid_after:
+            logger.info(f"Block {block_id}: Successfully repaired {repair_count} XML issues")
+            block['outputXML'] = repaired_xml
+            block['_xml_repaired'] = True
+            block['_xml_repairs'] = repair_count
+        else:
+            logger.error(f"Block {block_id}: Could not fully repair XML. Remaining errors: {remaining_errors}")
+            block['outputXML'] = repaired_xml  # Use partially repaired version
+            block['_xml_repaired'] = True
+            block['_xml_repairs'] = repair_count
+            block['_xml_errors'] = remaining_errors
+    else:
+        block['_xml_repaired'] = False
+
+    return block
 
 # Path to the prompt file
 PROMPT_FILE_PATH = os.path.join(
@@ -64,7 +236,7 @@ def load_cleaner_prompt() -> str:
 def call_gemini_api(
     prompt: str,
     user_content: str,
-    model: str = "gemini-2.0-flash-exp",
+    model: str = "gemini-2.5-pro",
     temperature: float = 0.0,
     max_tokens: int = 65536,
     project_id: Optional[str] = None,
@@ -188,6 +360,16 @@ def parse_gemini_xml_response(response_text: str) -> List[Dict[str, Any]]:
         if 'outputXML' not in block:
             raise ValueError("Block missing 'outputXML'")
 
+    # Validate and repair XML tags in each block
+    repaired_count = 0
+    for i, block in enumerate(blocks):
+        blocks[i] = validate_and_repair_block_xml(block)
+        if blocks[i].get('_xml_repaired'):
+            repaired_count += 1
+
+    if repaired_count > 0:
+        logger.info(f"XML validation: Repaired {repaired_count}/{len(blocks)} blocks with malformed XML")
+
     return blocks
 
 
@@ -196,7 +378,7 @@ def analyze_blocks_with_gemini(
     blocks: List[Dict[str, Any]],
     style: str = "dynamic",
     language: str = "es",
-    model: str = "gemini-2.0-flash-exp",
+    model: str = "gemini-2.5-pro",
     temperature: float = 0.0
 ) -> Dict[str, Any]:
     """

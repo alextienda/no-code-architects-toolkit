@@ -2,7 +2,354 @@
 
 Documentación completa de la API REST para el pipeline de edición automática de video con AI.
 
-**Versión**: 1.0.0
+**Versión**: 1.2.0
+
+---
+
+## Quick Start - Flujo Simplificado (Nuevo)
+
+> **Para el equipo Frontend**: El pipeline ahora es **automático**. Solo necesitan 3 interacciones:
+
+```javascript
+// 1. Crear workflow (auto-inicia transcripción + análisis)
+const createRes = await fetch('/v1/autoedit/workflow', {
+  method: 'POST',
+  headers: { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    video_url: 'https://...',
+    options: { language: 'es', style: 'dynamic' }
+  })
+});
+const { response: { workflow_id } } = await createRes.json();
+
+// 2. Polling hasta status === 'pending_review_1' (automático ~1-3 min)
+let status = 'created';
+while (!['pending_review_1', 'error'].includes(status)) {
+  await new Promise(r => setTimeout(r, 5000)); // esperar 5 segundos
+  const res = await fetch(`/v1/autoedit/workflow/${workflow_id}`, {
+    headers: { 'X-API-Key': API_KEY }
+  });
+  status = (await res.json()).status;
+}
+
+// 3. HITL 1: Revisar y aprobar XML (auto-genera preview)
+const xmlRes = await fetch(`/v1/autoedit/workflow/${workflow_id}/analysis`, {
+  headers: { 'X-API-Key': API_KEY }
+});
+const { combined_xml } = await xmlRes.json();
+// ... UI muestra XML, usuario modifica ...
+await fetch(`/v1/autoedit/workflow/${workflow_id}/analysis`, {
+  method: 'PUT',
+  headers: { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ updated_xml: modifiedXml })  // auto_continue=true por defecto
+});
+
+// 4. Polling hasta status === 'pending_review_2' (automático ~10-30 seg)
+while (!['pending_review_2', 'error'].includes(status)) {
+  await new Promise(r => setTimeout(r, 3000));
+  const res = await fetch(`/v1/autoedit/workflow/${workflow_id}`, {
+    headers: { 'X-API-Key': API_KEY }
+  });
+  status = (await res.json()).status;
+}
+
+// 5. HITL 2: Revisar preview y renderizar (async via Cloud Tasks)
+const previewRes = await fetch(`/v1/autoedit/workflow/${workflow_id}/preview`, {
+  headers: { 'X-API-Key': API_KEY }
+});
+const { preview_url, blocks } = await previewRes.json();
+// ... UI muestra preview video y timeline ...
+await fetch(`/v1/autoedit/workflow/${workflow_id}/render`, {
+  method: 'POST',
+  headers: { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ quality: 'high' })  // async_render=true por defecto
+});
+
+// 6. Polling hasta status === 'completed' (automático ~1-3 min)
+while (!['completed', 'error'].includes(status)) {
+  await new Promise(r => setTimeout(r, 5000));
+  const res = await fetch(`/v1/autoedit/workflow/${workflow_id}`, {
+    headers: { 'X-API-Key': API_KEY }
+  });
+  status = (await res.json()).status;
+}
+
+// 7. Obtener video final
+const resultRes = await fetch(`/v1/autoedit/workflow/${workflow_id}/result`, {
+  headers: { 'X-API-Key': API_KEY }
+});
+const { output_url } = await resultRes.json();
+```
+
+**Diagrama de Estados (Pipeline Automático via Cloud Tasks):**
+```
+POST /workflow (auto_start=true)
+         ↓
+      created
+         ↓ [Cloud Tasks: transcribe]
+    transcribing ───→ transcribed
+                           ↓ [Cloud Tasks: analyze]
+                      analyzing ───→ pending_review_1  ← HITL 1
+                                           ↓
+                                    PUT /analysis (auto_continue=true)
+                                           ↓ [Cloud Tasks: process]
+                                      processing
+                                           ↓ [Cloud Tasks: preview]
+                                  generating_preview
+                                           ↓
+                                    pending_review_2  ← HITL 2
+                                           ↓
+                                    POST /render (async_render=true)
+                                           ↓ [Cloud Tasks: render]
+                                       rendering
+                                           ↓
+                                       completed
+```
+
+---
+
+## Arquitectura: Cloud Tasks Pipeline
+
+El pipeline AutoEdit usa **Google Cloud Tasks** para procesamiento asíncrono automático con orquestación de tareas y almacenamiento persistente en Google Cloud Storage (GCS).
+
+### Flujo Automático
+
+| Paso | Endpoint | Cloud Tasks | Para en |
+|------|----------|-------------|---------|
+| 1 | POST /workflow | → enqueue transcribe | - |
+| 2 | - | transcribe → analyze | - |
+| 3 | - | analyze | **HITL 1** |
+| 4 | PUT /analysis | → enqueue process | - |
+| 5 | - | process → preview | - |
+| 6 | - | preview | **HITL 2** |
+| 7 | POST /render | → enqueue render | - |
+| 8 | - | render | **completed** |
+
+### Cómo Funciona Cloud Tasks
+
+**1. Orquestación Asíncrona:**
+- Cada endpoint puede encolar la tarea siguiente automáticamente
+- Cloud Tasks garantiza entrega de tareas con retry automático
+- Cada tarea se ejecuta de forma independiente y actualiza el workflow
+
+**2. Flujo de Orquestación:**
+```
+POST /workflow (auto_start=true)
+    ↓
+    Crea workflow en GCS
+    ↓
+    Encola tarea: /workflow/{id}/transcribe
+    ↓ [Cloud Tasks ejecuta en background]
+    Transcribe → actualiza workflow
+    ↓
+    Encola tarea: /workflow/{id}/analyze
+    ↓ [Cloud Tasks ejecuta en background]
+    Analyze → actualiza workflow → status: pending_review_1
+
+    ... usuario revisa XML ...
+
+PUT /analysis (auto_continue=true)
+    ↓
+    Actualiza workflow con XML aprobado
+    ↓
+    Encola tarea: /workflow/{id}/process
+    ↓ [Cloud Tasks ejecuta en background]
+    Process → actualiza workflow
+    ↓
+    Encola tarea: /workflow/{id}/preview
+    ↓ [Cloud Tasks ejecuta en background]
+    Preview → actualiza workflow → status: pending_review_2
+
+    ... usuario revisa preview ...
+
+POST /render (async_render=true)
+    ↓
+    Encola tarea: /workflow/{id}/render
+    ↓ [Cloud Tasks ejecuta en background]
+    Render → actualiza workflow → status: completed
+```
+
+**3. Cada Tarea Encola la Siguiente:**
+- `transcribe` automáticamente encola `analyze` al completar
+- `analyze` NO encola (para en HITL 1)
+- `process` automáticamente encola `preview` al completar
+- `preview` NO encola (para en HITL 2)
+- `render` es la tarea final (no encola nada)
+
+### Almacenamiento: GCS en lugar de /tmp
+
+**Workflows persistidos en GCS:**
+- Bucket: `gs://{GCS_BUCKET}/workflows/{workflow_id}.json`
+- **No se usa /tmp**: Los workflows se guardan en GCS para persistencia entre ejecuciones
+- TTL de 24 horas: Workflows se auto-eliminan después de 24h
+
+**Ventajas:**
+- Workflows sobreviven reinicios de Cloud Run
+- Múltiples workers pueden acceder al mismo workflow
+- Archivos temporales en /tmp, datos de workflow en GCS
+
+### Optimistic Locking
+
+Para evitar race conditions cuando múltiples tareas intentan actualizar el mismo workflow:
+
+**Conditional Updates:**
+```python
+# Cada update verifica la generación del objeto en GCS
+# Si otro proceso ya actualizó, la escritura falla y se reintenta
+
+update_workflow(workflow_id, data)
+    ↓
+    Read current workflow from GCS (get generation)
+    ↓
+    Modify data locally
+    ↓
+    Write to GCS IF generation matches
+    ↓
+    Success: workflow updated
+    Failure: retry (eventual consistency)
+```
+
+**Retry Logic:**
+- Máximo 3 reintentos para eventual consistency
+- Espera exponencial: 100ms, 200ms, 400ms
+- Previene pérdida de actualizaciones concurrentes
+
+### file_url vs output_url Fix
+
+**Problema Detectado:**
+El render FFmpeg puede retornar dos formatos diferentes:
+
+**Formato 1 (con file_url):**
+```json
+{
+  "file_url": "https://storage.googleapis.com/...",
+  "duration_ms": 13200
+}
+```
+
+**Formato 2 (con output_url):**
+```json
+{
+  "output_url": "https://storage.googleapis.com/...",
+  "duration_ms": 13200
+}
+```
+
+**Solución Implementada:**
+```python
+# Detectar ambos formatos
+file_url = render_result.get('file_url') or render_result.get('output_url')
+if not file_url:
+    raise ValueError("Render failed: No file_url or output_url returned")
+```
+
+### Beneficios
+
+- Frontend solo hace **3 POST** (crear, aprobar XML, aprobar render)
+- Backend ejecuta pasos intermedios automáticamente
+- Fallback a ejecución síncrona si Cloud Tasks falla
+- **Workflows persistentes en GCS** (no /tmp volátil)
+- **Optimistic locking** previene race conditions
+- **Retry automático** para robustez
+
+### Parámetros de Control
+
+| Parámetro | Default | Descripción |
+|-----------|---------|-------------|
+| `auto_start` | `true` | POST /workflow auto-inicia pipeline |
+| `auto_continue` | `true` | PUT /analysis auto-continúa a process→preview |
+| `async_render` | `true` | POST /render usa Cloud Tasks |
+
+Para **modo manual** (sin automático), pasar estos como `false`.
+
+### Fallback Síncrono
+
+**Si Cloud Tasks no está configurado:**
+- Variables de entorno: `GCP_PROJECT_ID`, `GCP_QUEUE_LOCATION`, `GCP_QUEUE_NAME`
+- Si faltan, el sistema ejecuta las tareas **síncronamente**
+- Mismo flujo, pero bloquea la petición HTTP hasta completar
+- Útil para desarrollo local sin infraestructura GCP
+
+**Ejemplo:**
+```python
+# Con Cloud Tasks (producción)
+POST /workflow → 201 Created (inmediato)
+  → Cloud Tasks ejecuta transcribe en background
+  → Frontend hace polling hasta pending_review_1
+
+# Sin Cloud Tasks (local/fallback)
+POST /workflow → 201 Created (después de transcribe+analyze completos)
+  → Ejecución síncrona
+  → Frontend recibe respuesta cuando llega a pending_review_1
+```
+
+### Cloud Tasks Limits y Quotas
+
+**Google Cloud Tasks Quotas (default):**
+- **Dispatch rate**: 500 tasks/second por cola
+- **Max concurrent dispatches**: 1000 tareas concurrentes
+- **Max task size**: 1 MB payload
+- **Max task retention**: 31 días
+- **Max queues per project**: 1000
+
+**AutoEdit Pipeline Configuración:**
+- Queue: `autoedit-pipeline`
+- Location: `us-central1`
+- Max concurrent: 100 (configurable)
+- Retry config: Max 3 attempts, exponential backoff
+
+**Monitoreo:**
+```bash
+# Ver tareas en cola
+gcloud tasks queues describe autoedit-pipeline --location=us-central1
+
+# Ver tareas ejecutándose
+gcloud tasks list --queue=autoedit-pipeline --location=us-central1
+```
+
+### Webhook Pattern con Cloud Tasks
+
+**Para notificaciones de completado:**
+
+El sistema soporta webhooks opcionales que se ejecutan **después** de cada paso:
+
+**Request con webhook_url:**
+```json
+{
+  "video_url": "https://...",
+  "webhook_url": "https://mi-backend.com/notify",
+  "auto_start": true
+}
+```
+
+**Comportamiento:**
+1. POST /workflow → encola transcribe
+2. Transcribe completa → POST a webhook_url con status
+3. Analyze completa → POST a webhook_url con status
+4. ... etc para cada paso
+
+**Payload del webhook:**
+```json
+{
+  "workflow_id": "550e8400-...",
+  "status": "pending_review_1",
+  "event": "analyze_complete",
+  "timestamp": "2025-01-15T10:35:00Z",
+  "data": {
+    "status_message": "HITL 1: Esperando revisión de XML"
+  }
+}
+```
+
+**Ventajas:**
+- Frontend no necesita hacer polling
+- Notificaciones push en tiempo real
+- Reduce carga del servidor (menos requests)
+
+**Retry en webhooks:**
+- Máximo 3 reintentos si falla
+- Exponential backoff: 5s, 15s, 45s
+- Timeout: 30 segundos por intento
 
 ---
 
@@ -19,6 +366,29 @@ https://nca-toolkit-djwypu7xmq-uc.a.run.app
 ```
 http://localhost:8080
 ```
+
+### Variables de Entorno
+
+**Requeridas para Cloud Tasks (Producción):**
+```bash
+# Cloud Tasks
+GCP_PROJECT_ID=autoedit-at
+GCP_QUEUE_LOCATION=us-central1
+GCP_QUEUE_NAME=autoedit-pipeline
+
+# GCS Workflow Storage
+GCS_BUCKET=your-bucket-name
+GCP_SA_CREDENTIALS={"type": "service_account", ...}
+
+# API Authentication
+API_KEY=your_api_key
+```
+
+**Opcionales para desarrollo local (sin Cloud Tasks):**
+- Si faltan `GCP_PROJECT_ID`, `GCP_QUEUE_LOCATION`, `GCP_QUEUE_NAME`:
+  - El sistema ejecuta tareas **síncronamente** (fallback)
+  - Workflows se almacenan en `/tmp` en lugar de GCS
+  - Útil para desarrollo y testing local
 
 ### Autenticación
 
@@ -122,6 +492,8 @@ const workflowId = createData.workflow_id;  // undefined!
 | GET | `/workflow/{id}` | No | `workflow_id` |
 | DELETE | `/workflow/{id}` | No | `workflow_id` |
 | GET | `/workflows` | No | `workflows[].workflow_id` |
+| POST | `/workflow/{id}/transcribe` | Sí | `response.workflow_id` |
+| POST | `/workflow/{id}/analyze` | Sí | `response.workflow_id` |
 | GET | `/workflow/{id}/analysis` | No | `workflow_id` |
 | PUT | `/workflow/{id}/analysis` | Sí | `response.workflow_id` |
 | POST | `/workflow/{id}/process` | Sí | `response.workflow_id` |
@@ -144,6 +516,8 @@ const workflowId = createData.workflow_id;  // undefined!
 | GET | `/v1/autoedit/workflow/{id}` | Obtener estado del workflow |
 | DELETE | `/v1/autoedit/workflow/{id}` | Eliminar workflow |
 | GET | `/v1/autoedit/workflows` | Listar todos los workflows |
+| POST | `/v1/autoedit/workflow/{id}/transcribe` | **Transcribir video con ElevenLabs** |
+| POST | `/v1/autoedit/workflow/{id}/analyze` | **Analizar transcripción con Gemini** |
 | GET | `/v1/autoedit/workflow/{id}/analysis` | Obtener XML para HITL 1 |
 | PUT | `/v1/autoedit/workflow/{id}/analysis` | Enviar XML revisado |
 | POST | `/v1/autoedit/workflow/{id}/process` | Procesar XML a blocks |
@@ -162,7 +536,7 @@ const workflowId = createData.workflow_id;  // undefined!
 
 ### POST /v1/autoedit/workflow
 
-Crear un nuevo workflow de edición automática.
+Crear un nuevo workflow de edición automática. **Por defecto, inicia automáticamente el pipeline de transcripción y análisis via Cloud Tasks.**
 
 **Request Body:**
 
@@ -175,18 +549,30 @@ Crear un nuevo workflow de edición automática.
     "skip_hitl_1": false,
     "skip_hitl_2": false
   },
+  "auto_start": true,
   "id": "mi-id-personalizado"
 }
 ```
 
-| Campo | Tipo | Requerido | Descripción |
-|-------|------|-----------|-------------|
-| `video_url` | string (uri) | Sí | URL del video a procesar |
-| `options.language` | string | No | Código de idioma (default: "es") |
-| `options.style` | string | No | Estilo de edición: "dynamic", "conservative", "aggressive" |
-| `options.skip_hitl_1` | boolean | No | Saltar revisión de XML (default: false) |
-| `options.skip_hitl_2` | boolean | No | Saltar revisión de preview (default: false) |
-| `id` | string | No | ID personalizado para el request |
+| Campo | Tipo | Requerido | Default | Descripción |
+|-------|------|-----------|---------|-------------|
+| `video_url` | string (uri) | Sí | - | URL del video a procesar |
+| `auto_start` | boolean | No | **true** | **Iniciar pipeline automáticamente** (transcribe → analyze) |
+| `options.language` | string | No | "es" | Código de idioma para transcripción |
+| `options.style` | string | No | "dynamic" | Estilo de edición: "dynamic", "conservative", "aggressive" |
+| `options.skip_hitl_1` | boolean | No | false | Saltar revisión de XML |
+| `options.skip_hitl_2` | boolean | No | false | Saltar revisión de preview |
+| `id` | string | No | - | ID personalizado para el request |
+
+**Comportamiento con `auto_start=true` (default):**
+1. Crea el workflow
+2. Encola tarea de transcripción en Cloud Tasks
+3. Cuando transcripción termina, encola análisis automáticamente
+4. Pipeline para en `pending_review_1` esperando HITL 1
+
+**Comportamiento con `auto_start=false`:**
+- Solo crea el workflow
+- Debe llamar manualmente a `/transcribe` y `/analyze`
 
 **Response (201 Created):**
 
@@ -195,14 +581,20 @@ Crear un nuevo workflow de edición automática.
   "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "created",
   "status_message": "Workflow creado",
-  "message": "Workflow created successfully"
+  "message": "Workflow created. Pipeline started automatically.",
+  "pipeline_started": true,
+  "task_enqueued": {
+    "success": true,
+    "task_type": "transcribe",
+    "task_name": "projects/autoedit-at/locations/us-central1/queues/autoedit-pipeline/tasks/..."
+  }
 }
 ```
 
 **cURL Example:**
 
 ```bash
-curl -X POST https://api.example.com/v1/autoedit/workflow \
+curl -X POST https://nca-toolkit-djwypu7xmq-uc.a.run.app/v1/autoedit/workflow \
   -H "X-API-Key: tu_api_key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -213,6 +605,8 @@ curl -X POST https://api.example.com/v1/autoedit/workflow \
     }
   }'
 ```
+
+> **Nota:** Después de crear, hacer polling en `GET /workflow/{id}` hasta `status === "pending_review_1"` (~1-3 minutos)
 
 ---
 
@@ -307,6 +701,138 @@ Listar todos los workflows, opcionalmente filtrados por estado.
 
 ---
 
+## Transcripción y Análisis
+
+> **IMPORTANTE**: Después de crear un workflow, DEBE llamar a `/transcribe` y luego a `/analyze` para que el workflow avance al estado `pending_review_1`.
+
+### POST /v1/autoedit/workflow/{workflow_id}/transcribe
+
+Transcribir el video usando ElevenLabs. Este paso es **obligatorio** después de crear el workflow.
+
+**Path Parameters:**
+
+| Parámetro | Tipo | Descripción |
+|-----------|------|-------------|
+| `workflow_id` | string | ID del workflow |
+
+**Request Body:**
+
+```json
+{
+  "language": "es"
+}
+```
+
+| Campo | Tipo | Requerido | Default | Descripción |
+|-------|------|-----------|---------|-------------|
+| `language` | string | No | "es" | Código de idioma para la transcripción |
+
+**Response (200 OK):**
+
+```json
+{
+  "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "transcribed",
+  "status_message": "Transcripción completa",
+  "transcript_word_count": 450,
+  "transcript_duration_ms": 45000,
+  "message": "Transcription complete. Ready for analysis."
+}
+```
+
+**Estados del Workflow:**
+- Antes: `created`
+- Durante: `transcribing`
+- Después: `transcribed`
+
+**cURL Example:**
+
+```bash
+curl -X POST "https://nca-toolkit-djwypu7xmq-uc.a.run.app/v1/autoedit/workflow/550e8400-e29b-41d4-a716-446655440000/transcribe" \
+  -H "X-API-Key: tu_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"language": "es"}'
+```
+
+**Notas:**
+- Este proceso puede tardar 30-120 segundos dependiendo de la duración del video
+- Usa ElevenLabs para transcripción con timestamps por palabra
+- El resultado se almacena internamente para el siguiente paso
+
+---
+
+### POST /v1/autoedit/workflow/{workflow_id}/analyze
+
+Analizar la transcripción con Gemini AI para identificar contenido a mantener/eliminar. Este paso es **obligatorio** después de transcribir.
+
+**Path Parameters:**
+
+| Parámetro | Tipo | Descripción |
+|-----------|------|-------------|
+| `workflow_id` | string | ID del workflow |
+
+**Request Body:**
+
+```json
+{
+  "style": "dynamic",
+  "custom_prompt": null
+}
+```
+
+| Campo | Tipo | Requerido | Default | Descripción |
+|-------|------|-----------|---------|-------------|
+| `style` | string | No | "dynamic" | Estilo de edición: "dynamic", "conservative", "aggressive" |
+| `custom_prompt` | string | No | null | Prompt personalizado para Gemini (opcional) |
+
+**Estilos de Edición:**
+
+| Estilo | Descripción |
+|--------|-------------|
+| `dynamic` | Balance entre mantener contenido y eliminar relleno |
+| `conservative` | Mantiene más contenido, menos agresivo |
+| `aggressive` | Elimina más agresivamente muletillas y pausas |
+
+**Response (200 OK):**
+
+```json
+{
+  "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "pending_review_1",
+  "status_message": "HITL 1: Esperando revisión de XML",
+  "gemini_blocks_count": 12,
+  "analysis_summary": {
+    "total_words": 450,
+    "words_to_keep": 380,
+    "words_to_remove": 70,
+    "removal_percentage": 15.5
+  },
+  "message": "Analysis complete. Ready for HITL 1 review."
+}
+```
+
+**Estados del Workflow:**
+- Antes: `transcribed`
+- Durante: `analyzing`
+- Después: `pending_review_1`
+
+**cURL Example:**
+
+```bash
+curl -X POST "https://nca-toolkit-djwypu7xmq-uc.a.run.app/v1/autoedit/workflow/550e8400-e29b-41d4-a716-446655440000/analyze" \
+  -H "X-API-Key: tu_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"style": "dynamic"}'
+```
+
+**Notas:**
+- Este proceso puede tardar 20-60 segundos
+- Usa Gemini (Vertex AI) para análisis semántico del contenido
+- Genera XML con tags `<mantener>` y `<eliminar>`
+- Después de este paso, el workflow está listo para HITL 1 (revisión de XML)
+
+---
+
 ## HITL 1: XML Review
 
 ### GET /v1/autoedit/workflow/{workflow_id}/analysis
@@ -334,19 +860,41 @@ Obtener el XML de análisis de Gemini para revisión del usuario.
 
 ### PUT /v1/autoedit/workflow/{workflow_id}/analysis
 
-Enviar el XML revisado/modificado por el usuario.
+Enviar el XML revisado/modificado por el usuario. **Por defecto, continúa automáticamente a process y preview via Cloud Tasks.**
 
 **Request Body:**
 
 ```json
 {
-  "updated_xml": "<resultado><mantener>Hola bienvenidos eh um al video de hoy</mantener></resultado>"
+  "updated_xml": "<resultado><mantener>Hola bienvenidos eh um al video de hoy</mantener></resultado>",
+  "auto_continue": true,
+  "config": {
+    "padding_before_ms": 90,
+    "padding_after_ms": 130,
+    "silence_threshold_ms": 50,
+    "merge_threshold_ms": 100
+  }
 }
 ```
 
-| Campo | Tipo | Requerido | Descripción |
-|-------|------|-----------|-------------|
-| `updated_xml` | string | Sí | XML con cambios del usuario |
+| Campo | Tipo | Requerido | Default | Descripción |
+|-------|------|-----------|---------|-------------|
+| `updated_xml` | string | Sí | - | XML con cambios del usuario |
+| `auto_continue` | boolean | No | **true** | **Continuar pipeline automáticamente** (process → preview) |
+| `config.padding_before_ms` | number | No | 90 | Padding antes de cada corte (0-500ms) |
+| `config.padding_after_ms` | number | No | 130 | Padding después de cada corte (0-500ms) |
+| `config.silence_threshold_ms` | number | No | 50 | Umbral para detectar silencios (0-500ms) |
+| `config.merge_threshold_ms` | number | No | 100 | Umbral para fusionar blocks cercanos (0-1000ms) |
+
+**Comportamiento con `auto_continue=true` (default):**
+1. Guarda el XML aprobado
+2. Encola tarea de process en Cloud Tasks
+3. Cuando process termina, encola preview automáticamente
+4. Pipeline para en `pending_review_2` esperando HITL 2
+
+**Comportamiento con `auto_continue=false`:**
+- Solo guarda el XML
+- Debe llamar manualmente a `/process` y `/preview`
 
 **Response (200 OK):**
 
@@ -354,13 +902,21 @@ Enviar el XML revisado/modificado por el usuario.
 {
   "workflow_id": "550e8400-...",
   "status": "xml_approved",
-  "message": "XML approved. Ready for processing to blocks."
+  "message": "XML approved. Pipeline continuing automatically.",
+  "pipeline_continuing": true,
+  "task_enqueued": {
+    "success": true,
+    "task_type": "process",
+    "task_name": "projects/autoedit-at/locations/us-central1/queues/autoedit-pipeline/tasks/..."
+  }
 }
 ```
 
 **Validación:**
 - El XML debe contener `<resultado>` como elemento raíz
 - Solo se permiten tags `<mantener>` y `<eliminar>`
+
+> **Nota:** Después de aprobar, hacer polling en `GET /workflow/{id}` hasta `status === "pending_review_2"` (~10-30 segundos)
 
 ---
 
@@ -589,14 +1145,15 @@ Modificar blocks (ajustar timestamps, split, merge, delete, restore).
 
 ### POST /v1/autoedit/workflow/{workflow_id}/render
 
-Aprobar blocks e iniciar render final de alta calidad.
+Aprobar blocks e iniciar render final de alta calidad. **Por defecto, el render se ejecuta asíncronamente via Cloud Tasks.**
 
 **Request Body:**
 
 ```json
 {
   "quality": "high",
-  "crossfade_duration": 0.025
+  "crossfade_duration": 0.025,
+  "async_render": true
 }
 ```
 
@@ -604,6 +1161,18 @@ Aprobar blocks e iniciar render final de alta calidad.
 |-------|------|---------|-------------|
 | `quality` | string | "high" | Calidad: "standard", "high", "4k" |
 | `crossfade_duration` | number | 0.025 | Duración del crossfade (0.01-0.5s) |
+| `async_render` | boolean | **true** | **Ejecutar render via Cloud Tasks (asíncrono)** |
+
+**Comportamiento con `async_render=true` (default):**
+1. Encola tarea de render en Cloud Tasks
+2. Retorna inmediatamente con status 202
+3. Render se ejecuta en background
+4. Hacer polling hasta `status === "completed"`
+
+**Comportamiento con `async_render=false`:**
+- Ejecuta render síncronamente
+- Bloquea hasta que el render termine (~1-3 minutos)
+- Retorna directamente el resultado
 
 **Calidades Disponibles:**
 
@@ -613,7 +1182,22 @@ Aprobar blocks e iniciar render final de alta calidad.
 | high | 18 | slow | Alta calidad |
 | 4k | 16 | slow | Máxima calidad |
 
-**Response (200 OK):**
+**Response con `async_render=true` (202 Accepted):**
+
+```json
+{
+  "workflow_id": "550e8400-...",
+  "status": "rendering",
+  "message": "Render started. Poll GET /workflow/{id}/render for status.",
+  "task_enqueued": {
+    "success": true,
+    "task_type": "render",
+    "task_name": "projects/autoedit-at/locations/us-central1/queues/autoedit-pipeline/tasks/..."
+  }
+}
+```
+
+**Response con `async_render=false` (200 OK):**
 
 ```json
 {
@@ -631,6 +1215,8 @@ Aprobar blocks e iniciar render final de alta calidad.
   "message": "Final render complete"
 }
 ```
+
+> **Nota:** Con `async_render=true`, hacer polling en `GET /workflow/{id}/render` hasta `status === "completed"` (~1-3 minutos)
 
 ---
 
@@ -839,22 +1425,37 @@ Causas comunes:
 
 ## Workflow States
 
-| Estado | Descripción | Siguiente Paso |
-|--------|-------------|----------------|
-| `created` | Workflow recién creado | Transcribir |
-| `transcribing` | Transcribiendo con ElevenLabs | Esperar |
-| `transcribed` | Transcripción completa | Analizar |
-| `analyzing` | Analizando con Gemini | Esperar |
-| `pending_review_1` | HITL 1: Esperando revisión de XML | GET/PUT analysis |
-| `xml_approved` | XML aprobado | POST process |
-| `processing` | Mapeando XML a timestamps | Esperar |
-| `generating_preview` | Generando preview low-res | Esperar |
-| `pending_review_2` | HITL 2: Preview listo | PATCH blocks o POST render |
-| `modifying_blocks` | Usuario modificando blocks | POST preview |
-| `regenerating_preview` | Regenerando preview | Esperar |
-| `rendering` | Procesando video final | GET render |
-| `completed` | Video final listo | GET result |
-| `error` | Error en algún paso | Ver detalles |
+| Estado | Descripción | Acción Requerida | Endpoint |
+|--------|-------------|------------------|----------|
+| `created` | Workflow recién creado | **Transcribir el video** | `POST /workflow/{id}/transcribe` |
+| `transcribing` | Transcribiendo con ElevenLabs | Esperar... | (polling con GET) |
+| `transcribed` | Transcripción completa | **Analizar con Gemini** | `POST /workflow/{id}/analyze` |
+| `analyzing` | Analizando con Gemini | Esperar... | (polling con GET) |
+| `pending_review_1` | HITL 1: XML listo para revisión | Revisar y aprobar XML | `GET/PUT /workflow/{id}/analysis` |
+| `xml_approved` | XML aprobado por usuario | **Procesar a blocks** | `POST /workflow/{id}/process` |
+| `processing` | Mapeando XML a timestamps | Esperar... | (polling con GET) |
+| `generating_preview` | Generando preview low-res | Esperar... | (polling con GET) |
+| `pending_review_2` | HITL 2: Preview listo | Revisar preview y aprobar | `GET /workflow/{id}/preview`, `POST /render` |
+| `modifying_blocks` | Usuario modificando blocks | Regenerar preview | `PATCH /blocks`, `POST /preview` |
+| `regenerating_preview` | Regenerando preview | Esperar... | (polling con GET) |
+| `rendering` | Procesando video final | Esperar... | `GET /workflow/{id}/render` |
+| `completed` | Video final listo | Obtener resultado | `GET /workflow/{id}/result` |
+| `error` | Error en algún paso | Ver detalles del error | `GET /workflow/{id}` |
+
+### Flujo Típico de Llamadas
+
+```
+1. POST /workflow                          → status: created
+2. POST /workflow/{id}/transcribe          → status: transcribing → transcribed
+3. POST /workflow/{id}/analyze             → status: analyzing → pending_review_1
+4. GET  /workflow/{id}/analysis            → obtener XML para UI
+5. PUT  /workflow/{id}/analysis            → status: xml_approved
+6. POST /workflow/{id}/process             → status: processing → generating_preview
+7. POST /workflow/{id}/preview             → status: pending_review_2
+8. (opcional) PATCH /workflow/{id}/blocks  → modificar y volver a POST /preview
+9. POST /workflow/{id}/render              → status: rendering → completed
+10. GET /workflow/{id}/result              → obtener video final
+```
 
 ---
 
@@ -868,6 +1469,40 @@ Causas comunes:
 ---
 
 ## Changelog
+
+### v1.2.0 (2025-01)
+- **Cloud Tasks Integration**: Orquestación asíncrona completa
+  - Cada tarea encola automáticamente la siguiente
+  - `transcribe → analyze → (HITL 1) → process → preview → (HITL 2) → render`
+  - Retry automático con exponential backoff
+- **GCS Workflow Storage**: Persistencia en Google Cloud Storage
+  - Workflows almacenados en GCS (no /tmp volátil)
+  - TTL de 24 horas con auto-limpieza
+  - Sobrevive reinicios y permite acceso multi-worker
+- **Optimistic Locking**: Prevención de race conditions
+  - Conditional updates con GCS generations
+  - Retry logic para eventual consistency (max 3 intentos)
+  - Previene pérdida de actualizaciones concurrentes
+- **file_url vs output_url Fix**: Manejo de formatos FFmpeg
+  - Detecta automáticamente `file_url` o `output_url` en respuesta de render
+  - Previene errores cuando FFmpeg cambia formato de respuesta
+- **Webhook Pattern**: Notificaciones push opcionales
+  - POST a webhook_url después de cada paso completado
+  - Retry con exponential backoff (3 intentos, 5s/15s/45s)
+  - Reduce necesidad de polling desde frontend
+- **Cloud Tasks Quotas**: Documentación de límites y monitoreo
+  - 500 tasks/sec dispatch rate
+  - 1000 tareas concurrentes máximo
+  - Comandos gcloud para monitoreo de colas
+
+### v1.1.0 (2025-01)
+- **Cloud Tasks Pipeline**: Procesamiento automático asíncrono
+  - `auto_start=true` por defecto en POST /workflow
+  - `auto_continue=true` por defecto en PUT /analysis
+  - `async_render=true` por defecto en POST /render
+- Frontend simplificado: solo 3 interacciones necesarias
+- Fallback automático a ejecución síncrona si Cloud Tasks falla
+- Nueva documentación con diagramas de flujo automático
 
 ### v1.0.0 (2025-01)
 - Release inicial con workflow completo

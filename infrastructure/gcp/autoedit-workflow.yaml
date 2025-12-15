@@ -1,0 +1,193 @@
+# AutoEdit A-Roll Workflow
+# Orchestrates AI-assisted video editing: Whisper -> Gemini -> FFmpeg
+#
+# Trigger: Eventarc (Storage object finalized)
+# Target: Cloud Run (nca-toolkit)
+
+main:
+  params: [event]
+  steps:
+    - init:
+        assign:
+          - project_id: "autoedit-at"
+          - location: "us-central1"
+          - input_bucket: ${event.data.bucket}
+          - filename: ${event.data.name}
+          - cloud_run_url: "https://nca-toolkit-djwypu7xmq-uc.a.run.app"
+          - api_key: "53528a94ca5ba5e12e9a0c95e5be5f9a8140e893b99f8e6b43b11f53d75382f7"
+          - output_bucket: "nca-toolkit-autoedit"
+
+    - log_start:
+        call: sys.log
+        args:
+          text: '${"[AutoEdit] Starting process for file: " + filename + " in bucket: " + input_bucket}'
+          severity: INFO
+
+    - check_file_type:
+        switch:
+          - condition: ${not text.match_regex(filename, ".*\\.mp4$")}
+            steps:
+              - log_skip:
+                  call: sys.log
+                  args:
+                    text: '${"[AutoEdit] Skipping non-MP4 file: " + filename}'
+                    severity: INFO
+              - return_skip:
+                  return:
+                    status: "skipped"
+                    reason: "File is not MP4"
+                    filename: ${filename}
+
+    - call_whisper:
+        call: http.post
+        args:
+          url: '${cloud_run_url + "/v1/media/transcribe"}'
+          headers:
+            X-API-Key: ${api_key}
+            Content-Type: "application/json"
+          timeout: 600
+          body:
+            media_url: '${"https://storage.googleapis.com/" + input_bucket + "/" + filename}'
+            task: "transcribe"
+            include_text: true
+            include_segments: true
+            word_timestamps: true
+            response_type: "direct"
+            language: "es"
+        result: whisper_response
+
+    - log_whisper_done:
+        call: sys.log
+        args:
+          text: '${"[AutoEdit] Whisper transcription completed for: " + filename}'
+          severity: INFO
+
+    - prepare_prompt:
+        call: http.post
+        args:
+          url: '${cloud_run_url + "/v1/logic/prepare-prompt"}'
+          headers:
+            X-API-Key: ${api_key}
+            Content-Type: "application/json"
+          body:
+            whisper_data: ${whisper_response.body.response}
+        result: prompt_data
+
+    - log_prompt_ready:
+        call: sys.log
+        args:
+          text: '${"[AutoEdit] Prompt prepared with " + string(prompt_data.body.response.total_segments) + " segments"}'
+          severity: INFO
+
+    - build_gemini_prompt:
+        assign:
+          - gemini_prompt: |
+              Eres un editor de video profesional especializado en crear contenido dinamico y atractivo.
+
+              TAREA: Analiza la transcripcion y decide que partes del video MANTENER para crear un corte profesional de A-Roll.
+
+              CRITERIOS DE EDICION:
+              - Elimina silencios largos (>2 segundos)
+              - Elimina muletillas y repeticiones
+              - Elimina errores verbales y correcciones
+              - Mantiene la narrativa coherente y fluida
+              - Prioriza momentos con alto valor informativo o emocional
+
+              FORMATO DE RESPUESTA OBLIGATORIO (JSON):
+              {"segments": [{"start": 0.0, "end": 5.2}, {"start": 8.1, "end": 12.0}]}
+
+              Estos segmentos representan las partes del video que se deben MANTENER.
+              Los tiempos estan en segundos (decimales permitidos).
+
+              TRANSCRIPCION CON TIEMPOS:
+          - full_prompt: '${gemini_prompt + prompt_data.body.response.system_prompt_context}'
+
+    - call_gemini:
+        call: http.post
+        args:
+          url: '${"https://" + location + "-aiplatform.googleapis.com/v1/projects/" + project_id + "/locations/" + location + "/publishers/google/models/gemini-2.0-flash-exp:generateContent"}'
+          auth:
+            type: OAuth2
+          headers:
+            Content-Type: "application/json"
+          body:
+            contents:
+              - role: "user"
+                parts:
+                  - text: ${full_prompt}
+            generationConfig:
+              temperature: 0.1
+              maxOutputTokens: 8192
+              responseMimeType: "application/json"
+        result: gemini_response
+
+    - log_gemini_done:
+        call: sys.log
+        args:
+          text: "[AutoEdit] Gemini AI analysis completed"
+          severity: INFO
+
+    - parse_cuts:
+        call: http.post
+        args:
+          url: '${cloud_run_url + "/v1/logic/parse-ai-decision"}'
+          headers:
+            X-API-Key: ${api_key}
+            Content-Type: "application/json"
+          body:
+            original_transcript: ${whisper_response.body.response}
+            ai_response_text: ${gemini_response.body.candidates[0].content.parts[0].text}
+        result: cut_instructions
+
+    - log_cuts_parsed:
+        call: sys.log
+        args:
+          text: '${"[AutoEdit] Parsed " + string(cut_instructions.body.response.total_segments) + " segments to keep"}'
+          severity: INFO
+
+    - check_segments:
+        switch:
+          - condition: ${len(cut_instructions.body.response.cuts) == 0}
+            steps:
+              - log_no_cuts:
+                  call: sys.log
+                  args:
+                    text: "[AutoEdit] No segments to cut, returning original video"
+                    severity: WARNING
+              - return_no_cuts:
+                  return:
+                    status: "completed"
+                    message: "No cuts needed - AI decided to keep full video"
+                    original_file: ${filename}
+
+    - process_video:
+        call: http.post
+        args:
+          url: '${cloud_run_url + "/v1/video/cut"}'
+          headers:
+            X-API-Key: ${api_key}
+            Content-Type: "application/json"
+          timeout: 1800
+          body:
+            video_url: '${"https://storage.googleapis.com/" + input_bucket + "/" + filename}'
+            cuts: ${cut_instructions.body.response.cuts}
+            video_codec: "libx264"
+            video_preset: "medium"
+            video_crf: 23
+            audio_codec: "aac"
+            audio_bitrate: "128k"
+        result: processing_result
+
+    - log_success:
+        call: sys.log
+        args:
+          text: '${"[AutoEdit] Video processing completed: " + processing_result.body.response}'
+          severity: INFO
+
+    - return_success:
+        return:
+          status: "success"
+          original_file: ${filename}
+          output_url: ${processing_result.body.response}
+          segments_kept: ${cut_instructions.body.response.total_segments}
+          duration_kept_seconds: ${cut_instructions.body.response.total_kept_duration_seconds}

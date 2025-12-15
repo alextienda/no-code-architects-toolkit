@@ -396,14 +396,26 @@ def blocks_to_cuts(blocks: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     Returns:
         List of cuts [{"start": "0.3", "end": "5.72"}, ...]
     """
+    if not blocks:
+        return []
+
+    # Validate blocks format
+    if not isinstance(blocks[0], dict):
+        logger.warning(f"blocks_to_cuts: blocks has wrong format (first item is {type(blocks[0])})")
+        return []
+
     cuts = []
     for block in blocks:
-        start_sec = block["inMs"] / 1000.0
-        end_sec = block["outMs"] / 1000.0
-        cuts.append({
-            "start": f"{start_sec:.3f}",
-            "end": f"{end_sec:.3f}"
-        })
+        if not isinstance(block, dict):
+            logger.warning(f"blocks_to_cuts: skipping non-dict block: {type(block)}")
+            continue
+        start_sec = block.get("inMs", 0) / 1000.0
+        end_sec = block.get("outMs", 0) / 1000.0
+        if end_sec > start_sec:  # Only add valid cuts
+            cuts.append({
+                "start": f"{start_sec:.3f}",
+                "end": f"{end_sec:.3f}"
+            })
     return cuts
 
 

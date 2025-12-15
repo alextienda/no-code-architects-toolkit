@@ -1,0 +1,197 @@
+# AutoEdit A-Roll Workflow V2
+# Orchestrates AI-assisted video editing with speaker diarization
+# Pipeline: Whisper+PyAnnote -> PrepareBlocks -> Gemini -> MapTimestamps -> FFmpeg
+#
+# Trigger: Eventarc (Storage object finalized)
+# Target: Cloud Run (nca-toolkit)
+#
+# Key improvements over v1:
+# - Speaker diarization with PyAnnote (identifies who's speaking)
+# - Full ~4000 word prompt for semantic analysis (matches Make.com quality)
+# - Separation of concerns: Gemini only does semantic analysis (no timestamps)
+# - Word-level timestamp mapping for precise cuts
+
+main:
+  params: [event]
+  steps:
+    - init:
+        assign:
+          - project_id: "autoedit-at"
+          - location: "us-central1"
+          - input_bucket: ${event.data.bucket}
+          - filename: ${event.data.name}
+          - cloud_run_url: "https://nca-toolkit-djwypu7xmq-uc.a.run.app"
+          - api_key: "53528a94ca5ba5e12e9a0c95e5be5f9a8140e893b99f8e6b43b11f53d75382f7"
+          - output_bucket: "nca-toolkit-autoedit"
+
+    - log_start:
+        call: sys.log
+        args:
+          text: '${"[AutoEdit V2] Starting process for file: " + filename + " in bucket: " + input_bucket}'
+          severity: INFO
+
+    # Check if file is MP4
+    - check_file_type:
+        switch:
+          - condition: ${not text.match_regex(filename, ".*\\.mp4$")}
+            steps:
+              - log_skip:
+                  call: sys.log
+                  args:
+                    text: '${"[AutoEdit V2] Skipping non-MP4 file: " + filename}'
+                    severity: INFO
+              - return_skip:
+                  return:
+                    status: "skipped"
+                    reason: "File is not MP4"
+                    filename: ${filename}
+
+    # Step 1: Transcription with Speaker Diarization
+    # Uses Whisper + PyAnnote to identify who's speaking when
+    - transcribe_with_speakers:
+        call: http.post
+        args:
+          url: '${cloud_run_url + "/v1/media/transcribe-speakers"}'
+          headers:
+            X-API-Key: ${api_key}
+            Content-Type: "application/json"
+          timeout: 900  # 15 min (diarization can be slow)
+          body:
+            media_url: '${"https://storage.googleapis.com/" + input_bucket + "/" + filename}'
+            language: "es"
+            word_timestamps: true
+            identify_speaker: "alex"
+            similarity_threshold: 0.75
+        result: transcription
+
+    - log_transcription:
+        call: sys.log
+        args:
+          text: '${"[AutoEdit V2] Transcription complete: " + string(transcription.body.response.total_segments) + " segments, " + string(len(transcription.body.response.speakers)) + " speakers"}'
+          severity: INFO
+
+    # Step 2: Prepare text blocks for Gemini (ONLY TEXT, no timestamps)
+    # This separates semantic analysis from timestamp mapping
+    - prepare_blocks:
+        call: http.post
+        args:
+          url: '${cloud_run_url + "/v1/autoedit/prepare-blocks"}'
+          headers:
+            X-API-Key: ${api_key}
+            Content-Type: "application/json"
+          body:
+            transcription: ${transcription.body.response}
+            merge_same_speaker: true
+            max_block_duration: 60.0
+        result: prepared_blocks
+
+    - log_blocks:
+        call: sys.log
+        args:
+          text: '${"[AutoEdit V2] Prepared " + string(prepared_blocks.body.response.total_blocks) + " blocks for analysis"}'
+          severity: INFO
+
+    # Step 3: Analyze with Gemini using full ~4000 word prompt
+    # Output is XML with <mantener>/<eliminar> tags (no timestamps)
+    - analyze_with_gemini:
+        call: http.post
+        args:
+          url: '${cloud_run_url + "/v1/autoedit/analyze-edit"}'
+          headers:
+            X-API-Key: ${api_key}
+            Content-Type: "application/json"
+          timeout: 300  # 5 min for Gemini
+          body:
+            text_blocks: ${prepared_blocks.body.response.blocks}
+            formatted_text: ${prepared_blocks.body.response.formatted_text}
+            config:
+              language: "es"
+              style: "dynamic"
+              model: "gemini-2.0-flash-exp"
+              temperature: 0.0
+        result: gemini_analysis
+
+    - log_analysis:
+        call: sys.log
+        args:
+          text: '${"[AutoEdit V2] Gemini analysis complete: " + string(gemini_analysis.body.response.total_blocks) + " blocks analyzed"}'
+          severity: INFO
+
+    # Step 4: Map XML output to actual timestamps
+    # Uses word-level alignment from original Whisper output
+    - map_timestamps:
+        call: http.post
+        args:
+          url: '${cloud_run_url + "/v1/autoedit/map-timestamps"}'
+          headers:
+            X-API-Key: ${api_key}
+            Content-Type: "application/json"
+          body:
+            gemini_output: ${gemini_analysis.body.response.blocks}
+            original_transcription: ${transcription.body.response}
+            block_to_segment_map: ${prepared_blocks.body.response.block_to_segment_map}
+            config:
+              padding_before_ms: 90
+              padding_after_ms: 90
+              merge_threshold_ms: 100
+              generate_cuts: true
+        result: timestamp_mapping
+
+    - log_mapping:
+        call: sys.log
+        args:
+          text: '${"[AutoEdit V2] Timestamp mapping complete. Keep ratio: " + string(timestamp_mapping.body.response.summary.keep_ratio) + ", Cuts: " + string(len(timestamp_mapping.body.response.cuts))}'
+          severity: INFO
+
+    # Check if we have cuts to process
+    - check_cuts:
+        switch:
+          - condition: ${len(timestamp_mapping.body.response.cuts) == 0}
+            steps:
+              - log_no_cuts:
+                  call: sys.log
+                  args:
+                    text: "[AutoEdit V2] No cuts needed - AI decided to keep full video"
+                    severity: WARNING
+              - return_no_cuts:
+                  return:
+                    status: "completed"
+                    message: "No cuts needed - AI decided to keep full video"
+                    original_file: ${filename}
+                    summary: ${timestamp_mapping.body.response.summary}
+
+    # Step 5: Process video with FFmpeg
+    - process_video:
+        call: http.post
+        args:
+          url: '${cloud_run_url + "/v1/video/cut"}'
+          headers:
+            X-API-Key: ${api_key}
+            Content-Type: "application/json"
+          timeout: 1800  # 30 min for video processing
+          body:
+            video_url: '${"https://storage.googleapis.com/" + input_bucket + "/" + filename}'
+            cuts: ${timestamp_mapping.body.response.cuts}
+            video_codec: "libx264"
+            video_preset: "medium"
+            video_crf: 23
+            audio_codec: "aac"
+            audio_bitrate: "128k"
+        result: processing_result
+
+    - log_success:
+        call: sys.log
+        args:
+          text: '${"[AutoEdit V2] Video processing completed: " + processing_result.body.response}'
+          severity: INFO
+
+    - return_success:
+        return:
+          status: "success"
+          original_file: ${filename}
+          output_url: ${processing_result.body.response}
+          summary: ${timestamp_mapping.body.response.summary}
+          speakers: ${transcription.body.response.speakers}
+          kept_duration_seconds: ${timestamp_mapping.body.response.summary.kept_duration}
+          removed_duration_seconds: ${timestamp_mapping.body.response.summary.removed_duration}
+          keep_ratio: ${timestamp_mapping.body.response.summary.keep_ratio}

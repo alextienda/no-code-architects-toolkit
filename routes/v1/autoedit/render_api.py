@@ -45,37 +45,35 @@ logger = logging.getLogger(__name__)
     "type": "object",
     "properties": {
         "quality": {"type": "string", "enum": ["standard", "high", "4k"]},
-        "crossfade_duration": {"type": "number", "minimum": 0.01, "maximum": 0.5}
+        "crossfade_duration": {"type": "number", "minimum": 0.01, "maximum": 0.5},
+        "async_render": {"type": "boolean", "default": True}
     },
     "additionalProperties": False
 })
-@queue_task_wrapper(bypass_queue=False)
-def approve_and_render(job_id, data):
+@queue_task_wrapper(bypass_queue=True)
+def approve_and_render(job_id, data, **kwargs):
     """Approve blocks and start final high-quality render.
 
-    This endpoint:
-    1. Marks blocks as approved
-    2. Starts the final render at specified quality
-    3. Updates workflow status to 'rendering'
+    With async_render=true (default), uses Cloud Tasks for async processing.
+    With async_render=false, renders synchronously (blocks until done).
 
     Request body:
         {
             "quality": "high",
-            "crossfade_duration": 0.025
+            "crossfade_duration": 0.025,
+            "async_render": true
         }
 
     Returns:
-        {
-            "workflow_id": "...",
-            "status": "rendering",
-            "estimated_time_seconds": 120
-        }
+        async=true: {"workflow_id": "...", "status": "rendering", "message": "Poll GET /render for status"}
+        async=false: {"workflow_id": "...", "status": "completed", "output_url": "..."}
     """
     workflow_id = request.view_args.get('workflow_id')
     quality = data.get('quality', 'high')
     crossfade_duration = data.get('crossfade_duration', 0.025)
+    async_render = data.get('async_render', True)
 
-    logger.info(f"Starting final render for workflow {workflow_id} at {quality} quality")
+    logger.info(f"Starting final render for workflow {workflow_id} at {quality} quality (async={async_render})")
 
     try:
         manager = get_workflow_manager()
@@ -96,44 +94,74 @@ def approve_and_render(job_id, data):
         if not blocks:
             return {"error": "No blocks available for render", "workflow_id": workflow_id}, "/v1/autoedit/workflow/render", 400
 
-        # Update status to rendering
-        manager.set_status(workflow_id, "rendering")
+        # Async render via Cloud Tasks
+        if async_render:
+            try:
+                from services.v1.autoedit.task_queue import continue_after_hitl2
 
-        # Get video duration
-        video_duration_ms = workflow.get("stats", {}).get("original_duration_ms", 0)
+                enqueue_result = continue_after_hitl2(
+                    workflow_id,
+                    quality=quality,
+                    crossfade_duration=crossfade_duration
+                )
 
-        # Generate final render
-        result = generate_final_render(
-            workflow_id=workflow_id,
-            video_url=workflow["video_url"],
-            blocks=blocks,
-            video_duration_ms=video_duration_ms,
-            quality=quality,
-            fade_duration=crossfade_duration
-        )
+                if enqueue_result.get("success"):
+                    manager.set_status(workflow_id, "rendering")
+                    return {
+                        "workflow_id": workflow_id,
+                        "status": "rendering",
+                        "message": "Render started. Poll GET /workflow/{id}/render for status.",
+                        "task_enqueued": enqueue_result
+                    }, "/v1/autoedit/workflow/render", 202
+                else:
+                    logger.warning(f"Failed to enqueue render: {enqueue_result}")
+                    # Fall back to sync render
+                    async_render = False
 
-        # Update workflow with output
-        manager.set_output(
-            workflow_id=workflow_id,
-            output_url=result["output_url"],
-            output_duration_ms=result["output_duration_ms"],
-            render_time_sec=result["stats"]["render_time_sec"]
-        )
+            except Exception as enqueue_error:
+                logger.warning(f"Async render failed to enqueue: {enqueue_error}. Falling back to sync.")
+                async_render = False
 
-        # Store the final cuts for reference
-        cuts = blocks_to_cuts(blocks)
-        manager.update(workflow_id, {"cuts": cuts})
+        # Sync render (fallback or requested)
+        if not async_render:
+            # Update status to rendering
+            manager.set_status(workflow_id, "rendering")
 
-        logger.info(f"Final render completed for workflow {workflow_id}: {result['output_url']}")
+            # Get video duration
+            video_duration_ms = workflow.get("stats", {}).get("original_duration_ms", 0)
 
-        return {
-            "workflow_id": workflow_id,
-            "status": "completed",
-            "output_url": result["output_url"],
-            "output_duration_ms": result["output_duration_ms"],
-            "stats": result["stats"],
-            "message": "Final render complete"
-        }, "/v1/autoedit/workflow/render", 200
+            # Generate final render
+            result = generate_final_render(
+                workflow_id=workflow_id,
+                video_url=workflow["video_url"],
+                blocks=blocks,
+                video_duration_ms=video_duration_ms,
+                quality=quality,
+                fade_duration=crossfade_duration
+            )
+
+            # Update workflow with output
+            manager.set_output(
+                workflow_id=workflow_id,
+                output_url=result["output_url"],
+                output_duration_ms=result["output_duration_ms"],
+                render_time_sec=result["stats"]["render_time_sec"]
+            )
+
+            # Store the final cuts for reference
+            cuts = blocks_to_cuts(blocks)
+            manager.update(workflow_id, {"cuts": cuts})
+
+            logger.info(f"Final render completed for workflow {workflow_id}: {result['output_url']}")
+
+            return {
+                "workflow_id": workflow_id,
+                "status": "completed",
+                "output_url": result["output_url"],
+                "output_duration_ms": result["output_duration_ms"],
+                "stats": result["stats"],
+                "message": "Final render complete"
+            }, "/v1/autoedit/workflow/render", 200
 
     except Exception as e:
         logger.error(f"Error rendering workflow {workflow_id}: {e}")
@@ -268,7 +296,7 @@ def get_result(workflow_id):
     "additionalProperties": False
 })
 @queue_task_wrapper(bypass_queue=False)
-def rerender(job_id, data):
+def rerender(job_id, data, **kwargs):
     """Re-render the video with different quality settings.
 
     Uses the already-approved blocks without requiring another HITL review.

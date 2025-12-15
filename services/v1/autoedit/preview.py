@@ -211,12 +211,36 @@ def _call_ffmpeg_compose(payload: Dict[str, Any], job_id: str) -> str:
             raise Exception(error_msg)
 
         result = response.json()
+        logger.debug(f"FFmpeg compose raw response type: {type(result)}, content: {str(result)[:500]}")
 
-        # Extract output URL from response
-        output_url = result.get("response", {}).get("output_url")
+        # Handle case where result is not a dict
+        if isinstance(result, list):
+            logger.error(f"FFmpeg compose returned a list instead of dict: {result}")
+            raise Exception(f"Unexpected response format from FFmpeg compose: {result}")
+
+        # Extract output URL from response - handle multiple response formats
+        response_data = result.get("response", {})
+
+        # Handle case where response is a list (shouldn't happen but defensive)
+        if isinstance(response_data, list):
+            logger.warning(f"FFmpeg compose response.response is a list: {response_data}")
+            if len(response_data) > 0 and isinstance(response_data[0], dict):
+                response_data = response_data[0]
+            else:
+                response_data = {}
+
+        output_url = None
+        if isinstance(response_data, dict):
+            # Try multiple possible field names
+            output_url = (
+                response_data.get("output_url") or
+                response_data.get("file_url") or
+                response_data.get("url")
+            )
+
         if not output_url:
-            # Try alternative response formats
-            output_url = result.get("output_url") or result.get("url")
+            # Try alternative response formats at root level
+            output_url = result.get("output_url") or result.get("file_url") or result.get("url")
 
         if not output_url:
             raise Exception(f"No output URL in response: {result}")

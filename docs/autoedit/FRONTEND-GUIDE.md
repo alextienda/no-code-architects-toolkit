@@ -155,7 +155,8 @@ function uploadWithProgress(file, uploadUrl, contentType, onProgress) {
 6. [HITL 2: Editor de Timeline](#hitl-2-editor-de-timeline)
 7. [Ejemplos de Código](#ejemplos-de-código)
 8. [Manejo de Errores](#manejo-de-errores)
-9. [Best Practices](#best-practices)
+9. [Cloud Tasks Integration](#cloud-tasks-integration)
+10. [Best Practices](#best-practices)
 
 ---
 
@@ -1159,12 +1160,443 @@ const handleWorkflowError = (workflow) => {
 
 ---
 
+## Cloud Tasks Integration
+
+### Overview
+
+AutoEdit usa Google Cloud Tasks para procesamiento asíncrono de operaciones pesadas. Cuando el backend encola un task, el frontend debe hacer polling del estado del workflow para detectar cuándo el task ha completado.
+
+### Task Lifecycle
+
+```
+POST /v1/autoedit/workflow/{id}/process
+    │
+    ├─► Backend retorna 202 con estado "task_enqueued"
+    │
+    ├─► Cloud Tasks ejecuta el task en background
+    │
+    └─► Frontend hace polling de GET /v1/autoedit/workflow/{id}
+            │
+            ├─► Mientras processing: continuar polling
+            │
+            └─► Cuando generating_preview: task completado
+```
+
+### Timeouts Recomendados por Operación
+
+```javascript
+const OPERATION_TIMEOUTS = {
+  // Tiempo máximo de polling antes de mostrar error
+  transcribe: 60000,      // 60s - Transcripción de audio
+  analyze: 30000,         // 30s - Análisis con LLM
+  process: 30000,         // 30s - Mapeo de XML a blocks
+  preview: 120000,        // 120s - Generación de preview video
+  render: 600000          // 600s (10min) - Render final
+};
+
+const POLLING_INTERVALS = {
+  // Intervalo entre polls por operación
+  transcribe: 3000,       // 3s
+  analyze: 2000,          // 2s
+  process: 2000,          // 2s
+  preview: 3000,          // 3s
+  render: 5000            // 5s
+};
+```
+
+### Eventual Consistency
+
+Después de que un Cloud Task modifica el estado del workflow, puede haber una latencia de ~2 segundos antes de que GET refleje los cambios debido a:
+
+1. Propagación de escritura a disco
+2. Caché del filesystem
+3. Latencia de red en GCP
+
+**Solución: Esperar estado específico, no solo polling inmediato**
+
+```javascript
+// ❌ INCORRECTO - Puede leer estado antiguo
+await processToBlocks(workflowId);
+const status = await getStatus(workflowId);  // Puede ser "processing" todavía
+
+// ✅ CORRECTO - Esperar estado deseado con retry
+await processToBlocks(workflowId);
+await waitForStatus(workflowId, ['generating_preview', 'error'], {
+  timeout: OPERATION_TIMEOUTS.process,
+  interval: POLLING_INTERVALS.process,
+  minWaitMs: 2000  // Esperar mínimo 2s antes del primer poll
+});
+```
+
+### Manejo de Errores de Cloud Tasks
+
+#### Errores Comunes
+
+```javascript
+// 1. Task encolado pero falló en ejecución
+{
+  "status": "error",
+  "error": "Task execution failed: FFmpeg error",
+  "error_details": {
+    "task_id": "12345",
+    "timestamp": "2025-12-12T10:30:00Z"
+  }
+}
+
+// 2. Task no pudo encolarse (problema de infraestructura)
+{
+  "code": 500,
+  "message": "Failed to enqueue task",
+  "response": {
+    "error": "Cloud Tasks queue unavailable"
+  }
+}
+
+// 3. Task timeout (excedió tiempo máximo de ejecución)
+{
+  "status": "error",
+  "error": "Task execution timeout",
+  "error_details": {
+    "max_execution_time": 600
+  }
+}
+```
+
+#### Detectar si un Task Falló
+
+```javascript
+/**
+ * Verifica si el workflow está en estado de error
+ */
+function isWorkflowFailed(workflow) {
+  return workflow.status === 'error';
+}
+
+/**
+ * Extrae información del error
+ */
+function getErrorInfo(workflow) {
+  if (!isWorkflowFailed(workflow)) return null;
+
+  return {
+    message: workflow.error || 'Unknown error',
+    details: workflow.error_details || {},
+    recoverable: isRecoverableError(workflow.error),
+    suggestedAction: getSuggestedAction(workflow.error)
+  };
+}
+
+function isRecoverableError(errorMessage) {
+  const recoverablePatterns = [
+    /timeout/i,
+    /temporary/i,
+    /network/i,
+    /queue unavailable/i
+  ];
+  return recoverablePatterns.some(pattern => pattern.test(errorMessage));
+}
+
+function getSuggestedAction(errorMessage) {
+  if (/timeout/i.test(errorMessage)) {
+    return 'retry';
+  }
+  if (/invalid video/i.test(errorMessage)) {
+    return 'new_video';
+  }
+  if (/queue unavailable/i.test(errorMessage)) {
+    return 'wait_and_retry';
+  }
+  return 'contact_support';
+}
+```
+
+#### Recovery Procedures
+
+```javascript
+/**
+ * Intenta recuperar un workflow fallido
+ */
+async function recoverWorkflow(workflowId, currentState) {
+  const errorInfo = getErrorInfo(currentState);
+
+  switch (errorInfo.suggestedAction) {
+    case 'retry':
+      // Reintentar la misma operación
+      return await retryLastOperation(workflowId, currentState);
+
+    case 'wait_and_retry':
+      // Esperar y reintentar (para errores de infraestructura)
+      await new Promise(r => setTimeout(r, 5000));
+      return await retryLastOperation(workflowId, currentState);
+
+    case 'new_video':
+      // Error irrecuperable del video, pedir nuevo upload
+      throw new Error('El video no puede procesarse. Por favor sube otro video.');
+
+    case 'contact_support':
+      // Error desconocido
+      throw new Error('Error del sistema. Contacta al soporte.');
+  }
+}
+
+/**
+ * Reintenta la última operación según el estado
+ */
+async function retryLastOperation(workflowId, workflow) {
+  // Determinar qué operación reintentar basado en el último estado válido
+  const lastState = workflow.previous_status || workflow.status;
+
+  if (lastState === 'xml_approved') {
+    return await processToBlocks(workflowId);
+  }
+  if (lastState === 'processing') {
+    return await generatePreview(workflowId);
+  }
+  if (lastState === 'pending_review_2' || lastState === 'modifying_blocks') {
+    return await generatePreview(workflowId);
+  }
+  if (lastState === 'regenerating_preview') {
+    return await renderFinal(workflowId);
+  }
+
+  throw new Error('No se puede determinar la operación a reintentar');
+}
+```
+
+### Webhook Integration (Opcional)
+
+Para evitar polling constante, puedes configurar un webhook que reciba notificaciones cuando un task complete.
+
+#### Configurar Webhook
+
+```javascript
+// Al crear el workflow, incluir webhook_url
+const createWorkflowWithWebhook = async (videoUrl, webhookUrl) => {
+  const response = await fetch(`${API_BASE_URL}/v1/autoedit/workflow`, {
+    method: 'POST',
+    headers: {
+      'X-API-Key': API_KEY,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      video_url: videoUrl,
+      webhook_url: webhookUrl  // Tu endpoint para recibir notificaciones
+    })
+  });
+
+  return await response.json();
+};
+```
+
+#### Formato del Payload del Webhook
+
+Cuando un task completa (exitoso o fallido), el backend envía un POST a tu webhook_url:
+
+```javascript
+// POST a tu webhook_url
+{
+  "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "generating_preview",  // Nuevo estado
+  "previous_status": "processing",
+  "operation": "process",           // Qué operación completó
+  "success": true,                  // true si exitoso, false si error
+  "timestamp": "2025-12-12T10:30:45Z",
+  "data": {
+    // Datos específicos de la operación
+    "blocks_count": 45,
+    "total_duration_ms": 180000
+  },
+  "error": null  // Si success=false, contiene mensaje de error
+}
+```
+
+#### Implementar Endpoint de Webhook
+
+```javascript
+// Backend de tu aplicación (Node.js/Express ejemplo)
+app.post('/api/webhooks/autoedit', async (req, res) => {
+  const { workflow_id, status, success, error, data } = req.body;
+
+  // 1. Validar firma (opcional pero recomendado)
+  // validateWebhookSignature(req);
+
+  // 2. Actualizar estado en tu DB
+  await db.workflows.update(workflow_id, {
+    status,
+    last_update: new Date(),
+    error: error || null
+  });
+
+  // 3. Notificar al frontend vía WebSocket/SSE
+  wsServer.send(workflow_id, {
+    type: 'workflow_update',
+    status,
+    success,
+    data
+  });
+
+  // 4. Responder 200 OK
+  res.status(200).json({ received: true });
+});
+```
+
+#### Frontend con Webhook (WebSocket)
+
+```javascript
+function useAutoEditWithWebhook(workflowId) {
+  const [status, setStatus] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    // Conectar a WebSocket de tu backend
+    const ws = new WebSocket(`wss://yourapp.com/ws/${workflowId}`);
+
+    ws.onmessage = (event) => {
+      const update = JSON.parse(event.data);
+
+      if (update.type === 'workflow_update') {
+        setStatus(update.status);
+
+        if (!update.success) {
+          setError(update.error);
+        }
+
+        // Actualizar UI según el nuevo estado
+        handleStatusChange(update.status);
+      }
+    };
+
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      // Fallback a polling
+      startPolling(workflowId);
+    };
+
+    return () => ws.close();
+  }, [workflowId]);
+
+  return { status, error };
+}
+```
+
+#### Ventajas del Webhook
+
+- Reduce carga del servidor (menos GET requests)
+- Notificaciones en tiempo real
+- Mejor experiencia de usuario (UX más responsive)
+
+#### Desventajas del Webhook
+
+- Requiere endpoint público accesible desde GCP
+- Mayor complejidad de implementación
+- Necesita manejo de reconexión/fallback
+
+**Recomendación: Usar polling para MVP, migrar a webhooks en producción si el volumen de usuarios es alto.**
+
+### Ejemplo Completo con Manejo de Errores
+
+```javascript
+/**
+ * Espera a que el workflow alcance un estado deseado
+ * con manejo robusto de errores y eventual consistency
+ */
+async function waitForStatus(workflowId, targetStatuses, options = {}) {
+  const {
+    timeout = 60000,
+    interval = 2000,
+    minWaitMs = 2000,  // Esperar mínimo antes del primer poll
+    onProgress = null
+  } = options;
+
+  const startTime = Date.now();
+
+  // Esperar mínimo antes del primer poll (eventual consistency)
+  if (minWaitMs > 0) {
+    await new Promise(r => setTimeout(r, minWaitMs));
+  }
+
+  let attempts = 0;
+  while (Date.now() - startTime < timeout) {
+    attempts++;
+
+    try {
+      const workflow = await getStatus(workflowId);
+
+      // Verificar si alcanzó estado deseado
+      if (targetStatuses.includes(workflow.status)) {
+        return workflow;
+      }
+
+      // Verificar si falló
+      if (workflow.status === 'error') {
+        const errorInfo = getErrorInfo(workflow);
+
+        if (errorInfo.recoverable && attempts <= 3) {
+          // Reintentar operación recuperable
+          console.warn(`Retrying after error: ${errorInfo.message}`);
+          await recoverWorkflow(workflowId, workflow);
+          // Continuar polling
+        } else {
+          // Error no recuperable
+          throw new Error(errorInfo.message);
+        }
+      }
+
+      // Callback de progreso
+      if (onProgress) {
+        onProgress({
+          status: workflow.status,
+          attempt: attempts,
+          elapsedMs: Date.now() - startTime
+        });
+      }
+
+    } catch (error) {
+      // Error de red o parsing
+      if (attempts >= 5) {
+        throw new Error(`Failed to get workflow status after ${attempts} attempts: ${error.message}`);
+      }
+      console.warn(`Network error on attempt ${attempts}, retrying...`);
+    }
+
+    // Esperar antes del siguiente poll
+    await new Promise(r => setTimeout(r, interval));
+  }
+
+  throw new Error(`Timeout waiting for status. Expected: ${targetStatuses.join(', ')}`);
+}
+
+// Uso
+try {
+  await processToBlocks(workflowId);
+
+  const result = await waitForStatus(
+    workflowId,
+    ['generating_preview', 'error'],
+    {
+      timeout: OPERATION_TIMEOUTS.process,
+      interval: POLLING_INTERVALS.process,
+      minWaitMs: 2000,
+      onProgress: ({ status, attempt, elapsedMs }) => {
+        console.log(`[${attempt}] Status: ${status} (${elapsedMs}ms elapsed)`);
+        updateProgressBar(elapsedMs / OPERATION_TIMEOUTS.process);
+      }
+    }
+  );
+
+  console.log('Process completed:', result);
+} catch (error) {
+  console.error('Process failed:', error);
+  showErrorToUser(error.message);
+}
+```
+
 ## Best Practices
 
 ### 1. Polling Eficiente
 
 ```javascript
-// Usar intervalos progresivos
+// Usar intervalos progresivos con límites por operación
 const pollWithBackoff = async (fn, condition, options = {}) => {
   const { initialInterval = 1000, maxInterval = 5000, timeout = 300000 } = options;
   let interval = initialInterval;

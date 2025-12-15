@@ -10,6 +10,8 @@ import requests
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import timedelta
 
+from services.v1.autoedit.analyze_edit import validate_xml_tags, repair_xml_tags
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -19,7 +21,7 @@ DEFAULT_CONFIG = {
     "padding_before_ms": 90,
     "padding_after_ms": 90,
     "max_block_duration_ms": 60000,
-    "gemini_model": "gemini-2.0-flash-exp",
+    "gemini_model": "gemini-2.5-pro",
     "gemini_temperature": 0.0,
     "filter_audio_tags": True,
     "gcp_project_id": "autoedit-at",
@@ -294,7 +296,7 @@ def combine_gemini_outputs(gemini_blocks: List[Dict]) -> str:
         gemini_blocks: List of Gemini analysis results
 
     Returns:
-        Combined XML string with single <resultado> root
+        Combined XML string with single <resultado> root (validated and repaired)
     """
     all_content = []
 
@@ -309,6 +311,21 @@ def combine_gemini_outputs(gemini_blocks: List[Dict]) -> str:
 
     combined = "<resultado>" + "".join(all_content) + "</resultado>"
     logger.info(f"Combined XML length: {len(combined)} chars")
+
+    # Validate and repair the combined XML
+    is_valid, errors = validate_xml_tags(combined)
+    if not is_valid:
+        logger.warning(f"Combined XML has issues: {errors}")
+        repaired, repair_count = repair_xml_tags(combined)
+        if repair_count > 0:
+            logger.info(f"Repaired {repair_count} issues in combined XML")
+            combined = repaired
+
+            # Validate again
+            is_valid_after, remaining_errors = validate_xml_tags(combined)
+            if not is_valid_after:
+                logger.error(f"Combined XML still has issues after repair: {remaining_errors}")
+
     return combined
 
 

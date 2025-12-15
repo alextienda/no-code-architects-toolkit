@@ -50,6 +50,13 @@ def calculate_gaps(
     Returns:
         List of gaps with timestamps and metadata
     """
+    # Validate transcript_words format - if malformed, skip text extraction
+    if transcript_words and len(transcript_words) > 0:
+        if not isinstance(transcript_words[0], dict):
+            import logging
+            logging.getLogger(__name__).warning(f"transcript_words has wrong format (first item is {type(transcript_words[0])}), skipping text extraction")
+            transcript_words = None
+
     if not blocks:
         return [{
             "id": generate_block_id(),
@@ -59,12 +66,18 @@ def calculate_gaps(
             "original_text": None
         }]
 
+    # Validate blocks format
+    if not isinstance(blocks[0], dict):
+        import logging
+        logging.getLogger(__name__).warning(f"blocks has wrong format (first item is {type(blocks[0])})")
+        return []
+
     # Sort blocks by start time
-    sorted_blocks = sorted(blocks, key=lambda b: b["inMs"])
+    sorted_blocks = sorted(blocks, key=lambda b: b.get("inMs", 0))
     gaps = []
 
     # Gap at the beginning
-    if sorted_blocks[0]["inMs"] > 0:
+    if sorted_blocks[0].get("inMs", 0) > 0:
         gaps.append({
             "id": generate_block_id(),
             "inMs": 0,
@@ -120,6 +133,9 @@ def _get_text_in_range(
 
     words_in_range = []
     for word in transcript_words:
+        # Skip if word is not a dict (defensive against malformed data)
+        if not isinstance(word, dict):
+            continue
         word_start = word.get("inMs", word.get("start", 0) * 1000)
         word_end = word.get("outMs", word.get("end", 0) * 1000)
 
@@ -478,9 +494,17 @@ def ensure_block_ids(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     Returns:
         Blocks with IDs added where missing
     """
+    if not blocks:
+        return []
+
+    # Validate blocks format
+    if not isinstance(blocks[0], dict):
+        logger.warning(f"ensure_block_ids: blocks has wrong format (first item is {type(blocks[0])})")
+        return blocks
+
     blocks = deepcopy(blocks)
     for block in blocks:
-        if not block.get("id"):
+        if isinstance(block, dict) and not block.get("id"):
             block["id"] = generate_block_id()
     return blocks
 
@@ -507,7 +531,19 @@ def calculate_stats(
             "removal_percentage": 100.0
         }
 
-    result_duration = sum(b["outMs"] - b["inMs"] for b in blocks)
+    # Validate blocks format
+    if not isinstance(blocks[0], dict):
+        logger.warning(f"calculate_stats: blocks has wrong format (first item is {type(blocks[0])})")
+        return {
+            "total_blocks": 0,
+            "original_duration_ms": video_duration_ms,
+            "result_duration_ms": 0,
+            "removed_duration_ms": video_duration_ms,
+            "removal_percentage": 100.0,
+            "error": "invalid_blocks_format"
+        }
+
+    result_duration = sum(b.get("outMs", 0) - b.get("inMs", 0) for b in blocks if isinstance(b, dict))
     removed_duration = video_duration_ms - result_duration
 
     return {
@@ -534,8 +570,16 @@ def add_preview_positions(
     Returns:
         Blocks with preview_inMs field added
     """
+    if not blocks:
+        return []
+
+    # Validate blocks format
+    if not isinstance(blocks[0], dict):
+        logger.warning(f"add_preview_positions: blocks has wrong format (first item is {type(blocks[0])})")
+        return blocks
+
     blocks = deepcopy(blocks)
-    sorted_blocks = sorted(blocks, key=lambda b: b["inMs"])
+    sorted_blocks = sorted(blocks, key=lambda b: b.get("inMs", 0))
 
     preview_position = 0
     for i, block in enumerate(sorted_blocks):

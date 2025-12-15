@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
     "additionalProperties": False
 })
 @queue_task_wrapper(bypass_queue=False)
-def process_to_blocks(job_id, data):
+def process_to_blocks(job_id, data, **kwargs):
     """Process approved XML to blocks with timestamps.
 
     Uses the unified-processor to map XML decisions to timestamps
@@ -231,7 +231,7 @@ def _estimate_video_duration(transcript):
     "additionalProperties": False
 })
 @queue_task_wrapper(bypass_queue=False)
-def generate_preview_endpoint(job_id, data):
+def generate_preview_endpoint(job_id, data, **kwargs):
     """Generate a low-res preview video.
 
     Request body:
@@ -401,7 +401,7 @@ def get_preview(workflow_id):
     "additionalProperties": False
 })
 @queue_task_wrapper(bypass_queue=True)
-def modify_blocks_endpoint(job_id, data):
+def modify_blocks_endpoint(job_id, data, **kwargs):
     """Modify blocks (adjust, split, merge, delete, restore gap).
 
     Request body:

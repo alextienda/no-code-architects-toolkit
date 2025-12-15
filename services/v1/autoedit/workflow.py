@@ -13,7 +13,8 @@
 """
 Workflow State Manager for AutoEdit Pipeline
 
-Manages workflow state with file-based storage (JSON files) and optional Redis backend.
+Manages workflow state with GCS-based storage for Cloud Run compatibility.
+Falls back to local file storage when GCS is not available.
 Supports TTL for automatic cleanup of stale workflows.
 """
 
@@ -29,6 +30,10 @@ from pathlib import Path
 from config import LOCAL_STORAGE_PATH
 
 logger = logging.getLogger(__name__)
+
+# GCS storage configuration
+GCS_BUCKET_NAME = os.environ.get("GCP_BUCKET_NAME", "")
+WORKFLOW_PREFIX = "workflows/"  # Prefix for workflow files in GCS
 
 # =============================================================================
 # WORKFLOW STATES
@@ -67,23 +72,46 @@ DEFAULT_TTL_HOURS = 24
 
 
 class WorkflowManager:
-    """Manages workflow state with file-based storage."""
+    """Manages workflow state with GCS-based storage (with local fallback)."""
 
     def __init__(self, storage_path: Optional[str] = None, ttl_hours: int = DEFAULT_TTL_HOURS):
         """Initialize the workflow manager.
 
         Args:
-            storage_path: Base path for workflow storage. Defaults to LOCAL_STORAGE_PATH/workflows
+            storage_path: Base path for local workflow storage (fallback).
             ttl_hours: Time-to-live for workflows in hours
         """
         self.storage_path = Path(storage_path or os.path.join(LOCAL_STORAGE_PATH, "workflows"))
         self.storage_path.mkdir(parents=True, exist_ok=True)
         self.ttl_hours = ttl_hours
-        logger.info(f"WorkflowManager initialized with storage: {self.storage_path}")
+
+        # Initialize GCS client if bucket is configured
+        self.use_gcs = bool(GCS_BUCKET_NAME)
+        self.gcs_client = None
+        self.gcs_bucket = None
+
+        if self.use_gcs:
+            try:
+                from google.cloud import storage
+                self.gcs_client = storage.Client()
+                self.gcs_bucket = self.gcs_client.bucket(GCS_BUCKET_NAME)
+                logger.info(f"WorkflowManager initialized with GCS storage: gs://{GCS_BUCKET_NAME}/{WORKFLOW_PREFIX}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize GCS client, falling back to local storage: {e}")
+                self.use_gcs = False
+                self.gcs_client = None
+                self.gcs_bucket = None
+
+        if not self.use_gcs:
+            logger.info(f"WorkflowManager initialized with local storage: {self.storage_path}")
 
     def _get_workflow_path(self, workflow_id: str) -> Path:
-        """Get the file path for a workflow."""
+        """Get the local file path for a workflow (fallback)."""
         return self.storage_path / f"{workflow_id}.json"
+
+    def _get_gcs_blob_name(self, workflow_id: str) -> str:
+        """Get the GCS blob name for a workflow."""
+        return f"{WORKFLOW_PREFIX}{workflow_id}.json"
 
     def _is_expired(self, workflow_data: Dict[str, Any]) -> bool:
         """Check if a workflow has expired based on TTL."""
@@ -147,66 +175,126 @@ class WorkflowManager:
         logger.info(f"Created workflow {workflow_id} for video: {video_url[:50]}...")
         return workflow_id
 
-    def get(self, workflow_id: str) -> Optional[Dict[str, Any]]:
+    def get(self, workflow_id: str, include_generation: bool = False) -> Optional[Dict[str, Any]]:
         """Get workflow data by ID.
 
         Args:
             workflow_id: Workflow identifier
+            include_generation: If True, include GCS generation number in _gcs_generation field
 
         Returns:
             Workflow data dict or None if not found/expired
         """
-        path = self._get_workflow_path(workflow_id)
-        if not path.exists():
-            logger.warning(f"Workflow not found: {workflow_id}")
-            return None
-
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            # Log storage mode being used
+            logger.info(f"[GET] Workflow {workflow_id}: use_gcs={self.use_gcs}, bucket={GCS_BUCKET_NAME}")
 
-            if self._is_expired(data):
-                logger.info(f"Workflow expired: {workflow_id}")
-                self.delete(workflow_id)
-                return None
+            if self.use_gcs and self.gcs_bucket:
+                # Use GCS (primary storage for Cloud Run)
+                blob_name = self._get_gcs_blob_name(workflow_id)
+                blob = self.gcs_bucket.blob(blob_name)
+                logger.info(f"[GET] Reading from GCS: gs://{GCS_BUCKET_NAME}/{blob_name}")
 
-            return data
+                # Reload to get current metadata including generation
+                blob.reload()
+                if not blob.exists():
+                    logger.warning(f"[GET] Workflow not found in GCS: {workflow_id}")
+                    return None
+
+                content = blob.download_as_string()
+                data = json.loads(content)
+
+                # Store generation number for conditional updates
+                if include_generation and blob.generation:
+                    data["_gcs_generation"] = blob.generation
+
+                logger.info(f"[GET] Loaded from GCS - status: {data.get('status')}, has_transcript: {data.get('transcript') is not None}, gen: {blob.generation}")
+
+                if self._is_expired(data):
+                    logger.info(f"Workflow expired: {workflow_id}")
+                    self.delete(workflow_id)
+                    return None
+                return data
+            else:
+                # Fall back to local storage (for development/testing)
+                logger.info(f"[GET] Reading from LOCAL storage (GCS not available)")
+                path = self._get_workflow_path(workflow_id)
+                if not path.exists():
+                    logger.warning(f"Workflow not found in local storage: {workflow_id}")
+                    return None
+
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+                logger.info(f"[GET] Loaded from LOCAL - status: {data.get('status')}")
+
+                if self._is_expired(data):
+                    logger.info(f"Workflow expired: {workflow_id}")
+                    self.delete(workflow_id)
+                    return None
+
+                return data
         except Exception as e:
             logger.error(f"Error loading workflow {workflow_id}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
 
-    def update(self, workflow_id: str, updates: Dict[str, Any]) -> bool:
-        """Update workflow data.
+    def update(self, workflow_id: str, updates: Dict[str, Any], max_retries: int = 5) -> bool:
+        """Update workflow data with optimistic locking to prevent race conditions.
+
+        Uses GCS generation-based conditional updates to ensure no data is lost
+        when multiple workers try to update the same workflow.
 
         Args:
             workflow_id: Workflow identifier
             updates: Dictionary of fields to update
+            max_retries: Maximum number of retries on conflict (default: 5)
 
         Returns:
             True if successful, False otherwise
         """
-        data = self.get(workflow_id)
-        if not data:
-            return False
+        from google.api_core import exceptions as gcs_exceptions
 
-        # Update fields
-        for key, value in updates.items():
-            if key in data:
-                data[key] = value
-            elif key.startswith("stats."):
-                # Handle nested stats updates like "stats.render_time_sec"
-                stat_key = key.split(".", 1)[1]
-                if data["stats"] is None:
-                    data["stats"] = {}
-                data["stats"][stat_key] = value
+        for attempt in range(max_retries):
+            # Get current data with generation number for conditional update
+            data = self.get(workflow_id, include_generation=True)
+            if not data:
+                return False
 
-        data["updated_at"] = datetime.utcnow().isoformat()
+            # Extract and remove generation number from data
+            generation = data.pop("_gcs_generation", None)
 
-        # Update status message if status changed
-        if "status" in updates and updates["status"] in WORKFLOW_STATES:
-            data["status_message"] = WORKFLOW_STATES[updates["status"]]
+            # Update fields
+            for key, value in updates.items():
+                if key in data:
+                    data[key] = value
+                elif key.startswith("stats."):
+                    # Handle nested stats updates like "stats.render_time_sec"
+                    stat_key = key.split(".", 1)[1]
+                    if data["stats"] is None:
+                        data["stats"] = {}
+                    data["stats"][stat_key] = value
 
-        return self._save(workflow_id, data)
+            data["updated_at"] = datetime.utcnow().isoformat()
+
+            # Update status message if status changed
+            if "status" in updates and updates["status"] in WORKFLOW_STATES:
+                data["status_message"] = WORKFLOW_STATES[updates["status"]]
+
+            # Try to save with conditional update
+            try:
+                success = self._save(workflow_id, data, if_generation_match=generation)
+                if success:
+                    return True
+            except gcs_exceptions.PreconditionFailed:
+                # Another process updated the blob, retry with fresh data
+                logger.warning(f"[UPDATE] Conflict on workflow {workflow_id}, retrying (attempt {attempt + 1}/{max_retries})")
+                time.sleep(0.1 * (attempt + 1))  # Exponential backoff
+                continue
+
+        logger.error(f"[UPDATE] Failed to update workflow {workflow_id} after {max_retries} retries")
+        return False
 
     def set_status(
         self,
@@ -386,16 +474,25 @@ class WorkflowManager:
         Returns:
             True if deleted, False if not found
         """
-        path = self._get_workflow_path(workflow_id)
-        if path.exists():
-            try:
-                path.unlink()
-                logger.info(f"Deleted workflow: {workflow_id}")
-                return True
-            except Exception as e:
-                logger.error(f"Error deleting workflow {workflow_id}: {e}")
+        try:
+            if self.use_gcs and self.gcs_bucket:
+                blob_name = self._get_gcs_blob_name(workflow_id)
+                blob = self.gcs_bucket.blob(blob_name)
+                if blob.exists():
+                    blob.delete()
+                    logger.info(f"Deleted workflow from GCS: {workflow_id}")
+                    return True
                 return False
-        return False
+            else:
+                path = self._get_workflow_path(workflow_id)
+                if path.exists():
+                    path.unlink()
+                    logger.info(f"Deleted workflow: {workflow_id}")
+                    return True
+                return False
+        except Exception as e:
+            logger.error(f"Error deleting workflow {workflow_id}: {e}")
+            return False
 
     def list_workflows(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         """List all workflows, optionally filtered by status.
@@ -407,29 +504,61 @@ class WorkflowManager:
             List of workflow summaries
         """
         workflows = []
-        for path in self.storage_path.glob("*.json"):
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
 
-                if self._is_expired(data):
-                    self.delete(data["workflow_id"])
-                    continue
+        try:
+            if self.use_gcs and self.gcs_bucket:
+                # List workflows from GCS
+                blobs = self.gcs_bucket.list_blobs(prefix=WORKFLOW_PREFIX)
+                for blob in blobs:
+                    if not blob.name.endswith('.json'):
+                        continue
+                    try:
+                        content = blob.download_as_string()
+                        data = json.loads(content)
 
-                if status and data.get("status") != status:
-                    continue
+                        if self._is_expired(data):
+                            self.delete(data["workflow_id"])
+                            continue
 
-                # Return summary, not full data
-                workflows.append({
-                    "workflow_id": data["workflow_id"],
-                    "status": data["status"],
-                    "status_message": data.get("status_message", ""),
-                    "video_url": data["video_url"][:50] + "..." if len(data.get("video_url", "")) > 50 else data.get("video_url", ""),
-                    "created_at": data["created_at"],
-                    "updated_at": data["updated_at"]
-                })
-            except Exception as e:
-                logger.error(f"Error reading workflow {path.stem}: {e}")
+                        if status and data.get("status") != status:
+                            continue
+
+                        workflows.append({
+                            "workflow_id": data["workflow_id"],
+                            "status": data["status"],
+                            "status_message": data.get("status_message", ""),
+                            "video_url": data["video_url"][:50] + "..." if len(data.get("video_url", "")) > 50 else data.get("video_url", ""),
+                            "created_at": data["created_at"],
+                            "updated_at": data["updated_at"]
+                        })
+                    except Exception as e:
+                        logger.error(f"Error reading workflow from GCS {blob.name}: {e}")
+            else:
+                # List from local storage
+                for path in self.storage_path.glob("*.json"):
+                    try:
+                        with open(path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+
+                        if self._is_expired(data):
+                            self.delete(data["workflow_id"])
+                            continue
+
+                        if status and data.get("status") != status:
+                            continue
+
+                        workflows.append({
+                            "workflow_id": data["workflow_id"],
+                            "status": data["status"],
+                            "status_message": data.get("status_message", ""),
+                            "video_url": data["video_url"][:50] + "..." if len(data.get("video_url", "")) > 50 else data.get("video_url", ""),
+                            "created_at": data["created_at"],
+                            "updated_at": data["updated_at"]
+                        })
+                    except Exception as e:
+                        logger.error(f"Error reading workflow {path.stem}: {e}")
+        except Exception as e:
+            logger.error(f"Error listing workflows: {e}")
 
         # Sort by updated_at descending
         workflows.sort(key=lambda x: x["updated_at"], reverse=True)
@@ -442,36 +571,83 @@ class WorkflowManager:
             Number of workflows deleted
         """
         count = 0
-        for path in self.storage_path.glob("*.json"):
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                if self._is_expired(data):
-                    path.unlink()
-                    count += 1
-                    logger.info(f"Cleaned up expired workflow: {data.get('workflow_id')}")
-            except Exception as e:
-                logger.error(f"Error during cleanup of {path.stem}: {e}")
+        try:
+            if self.use_gcs and self.gcs_bucket:
+                # Cleanup from GCS
+                blobs = self.gcs_bucket.list_blobs(prefix=WORKFLOW_PREFIX)
+                for blob in blobs:
+                    if not blob.name.endswith('.json'):
+                        continue
+                    try:
+                        content = blob.download_as_string()
+                        data = json.loads(content)
+                        if self._is_expired(data):
+                            blob.delete()
+                            count += 1
+                            logger.info(f"Cleaned up expired workflow from GCS: {data.get('workflow_id')}")
+                    except Exception as e:
+                        logger.error(f"Error during GCS cleanup of {blob.name}: {e}")
+            else:
+                # Cleanup from local storage
+                for path in self.storage_path.glob("*.json"):
+                    try:
+                        with open(path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        if self._is_expired(data):
+                            path.unlink()
+                            count += 1
+                            logger.info(f"Cleaned up expired workflow: {data.get('workflow_id')}")
+                    except Exception as e:
+                        logger.error(f"Error during cleanup of {path.stem}: {e}")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
         return count
 
-    def _save(self, workflow_id: str, data: Dict[str, Any]) -> bool:
-        """Save workflow data to file.
+    def _save(self, workflow_id: str, data: Dict[str, Any], if_generation_match: Optional[int] = None) -> bool:
+        """Save workflow data to storage (GCS or local file).
 
         Args:
             workflow_id: Workflow identifier
             data: Workflow data
+            if_generation_match: If provided, only save if blob generation matches (for GCS)
+                                 Raises PreconditionFailed if generation doesn't match
 
         Returns:
             True if successful
+
+        Raises:
+            google.api_core.exceptions.PreconditionFailed: If generation doesn't match (GCS only)
         """
-        path = self._get_workflow_path(workflow_id)
-        try:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+        json_data = json.dumps(data, indent=2, ensure_ascii=False)
+
+        if self.use_gcs and self.gcs_bucket:
+            # Save to GCS with optional conditional update
+            blob_name = self._get_gcs_blob_name(workflow_id)
+            blob = self.gcs_bucket.blob(blob_name)
+
+            # Use conditional update if generation provided
+            if if_generation_match is not None:
+                blob.upload_from_string(
+                    json_data,
+                    content_type='application/json',
+                    if_generation_match=if_generation_match
+                )
+            else:
+                blob.upload_from_string(json_data, content_type='application/json')
+
+            logger.info(f"[SAVE] Saved workflow {workflow_id} to GCS - status: {data.get('status')}, has_transcript: {data.get('transcript') is not None}")
             return True
-        except Exception as e:
-            logger.error(f"Error saving workflow {workflow_id}: {e}")
-            return False
+        else:
+            # Fall back to local file
+            try:
+                path = self._get_workflow_path(workflow_id)
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(json_data)
+                logger.info(f"[SAVE] Saved workflow {workflow_id} to LOCAL - status: {data.get('status')}")
+                return True
+            except Exception as e:
+                logger.error(f"Error saving workflow {workflow_id}: {e}")
+                return False
 
 
 # =============================================================================
@@ -486,10 +662,23 @@ def get_workflow_manager() -> WorkflowManager:
     """Get the global workflow manager instance.
 
     Creates the instance on first call.
+    Reinitializes if GCS configuration changed.
     """
     global _workflow_manager
+
+    # Check if we need to reinitialize (e.g., GCS bucket was configured after init)
+    bucket_name = os.environ.get("GCP_BUCKET_NAME", "")
+    should_use_gcs = bool(bucket_name)
+
+    if _workflow_manager is not None:
+        # Reinitialize if GCS availability changed
+        if should_use_gcs and not _workflow_manager.use_gcs:
+            logger.info("Reinitializing WorkflowManager: GCS now available")
+            _workflow_manager = None
+
     if _workflow_manager is None:
         _workflow_manager = WorkflowManager()
+
     return _workflow_manager
 
 

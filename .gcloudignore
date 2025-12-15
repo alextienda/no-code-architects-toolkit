@@ -1,0 +1,40 @@
+# This file specifies files that are *not* uploaded to Google Cloud Build
+# It follows the same syntax as .gitignore
+
+# Git files
+.git
+.gitignore
+
+# Credential and config files - DO NOT upload
+gcp-sa-key.json
+*.json
+!package.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment files
+.env
+.env.*
+*.env
+
+# IDE and local config
+.vscode/
+.claude/
+.idea/
+
+# Documentation (not needed in build)
+docs/
+*.md
+
+# Local development files
+docker-compose*.yml
+*.log
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
