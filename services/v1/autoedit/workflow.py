@@ -144,6 +144,9 @@ class WorkflowManager:
             "created_at": now,
             "updated_at": now,
 
+            # Project association (optional - for multi-video projects)
+            "project_id": (options or {}).get("project_id"),
+
             # Data storage (populated as workflow progresses)
             "transcript": None,           # ElevenLabs transcript
             "transcript_internal": None,  # Internal format with NumID
@@ -156,6 +159,10 @@ class WorkflowManager:
             "preview_duration_ms": None,
             "output_url": None,           # Final video URL
             "output_duration_ms": None,
+
+            # B-Roll analysis (Phase 3)
+            "broll_segments": None,       # B-Roll segments from visual analysis
+            "broll_analysis_complete": False,  # Flag for parallel processing
 
             # Statistics
             "stats": {

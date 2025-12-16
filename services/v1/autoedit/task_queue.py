@@ -255,6 +255,111 @@ def continue_after_hitl2(workflow_id: str, quality: str = "high", crossfade_dura
     )
 
 
+def start_project_pipeline(
+    project_id: str,
+    parallel_limit: int = 3,
+    webhook_url: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Start batch processing for all videos in a project.
+
+    Enqueues transcription tasks for all pending workflows in the project.
+    Tasks are staggered to respect parallel_limit.
+
+    Args:
+        project_id: The project ID to process
+        parallel_limit: Max workflows to process in parallel (default 3)
+        webhook_url: Optional webhook for progress notifications
+
+    Returns:
+        Result dict with tasks_enqueued count and details
+    """
+    from services.v1.autoedit.project import get_project
+    from services.v1.autoedit.workflow import get_workflow
+
+    logger.info(f"Starting batch pipeline for project {project_id} (parallel_limit={parallel_limit})")
+
+    project = get_project(project_id)
+    if not project:
+        return {
+            "success": False,
+            "error": "Project not found",
+            "project_id": project_id
+        }
+
+    workflow_ids = project.get("workflow_ids", [])
+    if not workflow_ids:
+        return {
+            "success": False,
+            "error": "No videos in project",
+            "project_id": project_id
+        }
+
+    # Get project options for all workflows
+    project_options = project.get("options", {})
+    language = project_options.get("language", "es")
+    style = project_options.get("style", "dynamic")
+
+    tasks_enqueued = []
+    errors = []
+
+    # Filter to only pending workflows (status = created)
+    pending_workflows = []
+    for wf_id in workflow_ids:
+        wf = get_workflow(wf_id)
+        if wf and wf.get("status") == "created":
+            pending_workflows.append(wf_id)
+
+    logger.info(f"Project {project_id}: {len(pending_workflows)} pending workflows out of {len(workflow_ids)} total")
+
+    # Enqueue tasks with staggered delays for parallel processing
+    for i, workflow_id in enumerate(pending_workflows):
+        # Calculate delay to stagger starts (respect parallel_limit)
+        batch_number = i // parallel_limit
+        delay_seconds = batch_number * 5  # 5 second stagger between batches
+
+        try:
+            result = enqueue_task(
+                task_type="transcribe",
+                workflow_id=workflow_id,
+                payload={
+                    "language": language,
+                    "style": style,
+                    "project_id": project_id,
+                    "webhook_url": webhook_url
+                },
+                delay_seconds=delay_seconds
+            )
+
+            if result.get("success"):
+                tasks_enqueued.append({
+                    "workflow_id": workflow_id,
+                    "task_name": result.get("task_name"),
+                    "delay_seconds": delay_seconds
+                })
+            else:
+                errors.append({
+                    "workflow_id": workflow_id,
+                    "error": result.get("error")
+                })
+
+        except Exception as e:
+            errors.append({
+                "workflow_id": workflow_id,
+                "error": str(e)
+            })
+
+    return {
+        "success": len(tasks_enqueued) > 0,
+        "project_id": project_id,
+        "tasks_enqueued": len(tasks_enqueued),
+        "total_workflows": len(workflow_ids),
+        "pending_workflows": len(pending_workflows),
+        "tasks": tasks_enqueued,
+        "errors": errors if errors else None
+    }
+
+
 # Fallback for local development without Cloud Tasks
 def enqueue_task_local(
     task_type: str,
