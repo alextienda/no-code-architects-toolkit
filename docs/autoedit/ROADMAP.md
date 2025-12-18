@@ -30,16 +30,36 @@
 
 ---
 
-## Fase 3: Multi-Video Support 📋 PLANIFICADO
+## Fase 3: Multi-Video Projects + B-Roll Analysis ✅ COMPLETADO (Diciembre 2024)
 
-### Objetivos
-- [ ] Workflows con múltiples videos de entrada
-- [ ] Timeline unificado multi-source
-- [ ] Transiciones entre videos
-- [ ] Audio mixing de múltiples fuentes
+### Logros
+- [x] **ProjectManager** con CRUD completo en GCS
+- [x] **9 endpoints REST** para gestión de proyectos
+- [x] **Batch processing** con parallel_limit configurable
+- [x] **B-Roll Analysis** con Gemini 2.5 Pro Vision via Vertex AI
+- [x] **Frame extraction** con FFmpeg (1 frame/2s, max 30)
+- [x] **7 categorías B-Roll**: establishing, detail, transition, ambient, action, nature, graphic
+- [x] **38 tests estructurales** en `tests/test_fase3_projects_broll.py`
+- [x] Documentación completa para frontend
 
-### Prioridad: BAJA
-### ETA: Q2 2025
+### Archivos Creados
+- `services/v1/autoedit/project.py` - ProjectManager
+- `routes/v1/autoedit/project_api.py` - 9 endpoints REST
+- `services/v1/autoedit/analyze_broll.py` - Análisis B-Roll
+- `services/v1/autoedit/frame_extractor.py` - Extracción de frames
+- `infrastructure/prompts/autoedit_broll_prompt.txt` - System prompt
+
+### Endpoints de Proyecto
+```
+POST   /v1/autoedit/project              - Crear proyecto
+GET    /v1/autoedit/project/{id}         - Obtener proyecto
+DELETE /v1/autoedit/project/{id}         - Eliminar proyecto
+GET    /v1/autoedit/projects             - Listar proyectos
+POST   /v1/autoedit/project/{id}/videos  - Agregar videos
+DELETE /v1/autoedit/project/{id}/videos/{wf} - Remover video
+POST   /v1/autoedit/project/{id}/start   - Iniciar batch
+GET    /v1/autoedit/project/{id}/stats   - Estadísticas
+```
 
 ---
 

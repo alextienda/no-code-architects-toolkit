@@ -1695,8 +1695,669 @@ useEffect(() => {
 
 ---
 
+## Multi-Video Projects (Fase 3)
+
+### Concepto
+
+Los **proyectos** permiten agrupar múltiples videos para procesamiento batch. En lugar de procesar videos uno por uno, puedes:
+
+1. Crear un proyecto con configuración compartida
+2. Agregar múltiples videos al proyecto
+3. Iniciar el procesamiento de todos los videos en paralelo
+4. Monitorear el progreso agregado
+
+### Estados del Proyecto
+
+```
+created → ready → processing → completed
+                      ↓
+               partial_complete (algunos videos fallaron)
+                      ↓
+                   failed (todos fallaron)
+```
+
+| Estado | Descripción |
+|--------|-------------|
+| `created` | Proyecto creado, sin videos |
+| `ready` | Tiene videos, listo para procesar |
+| `processing` | Procesamiento batch en curso |
+| `completed` | Todos los videos completados |
+| `partial_complete` | Algunos videos fallaron |
+| `failed` | Todos los videos fallaron |
+
+### Flujo de Uso
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  PASO 1: CREAR PROYECTO                                         │
+│  POST /v1/autoedit/project                                      │
+│  - Nombre del proyecto                                          │
+│  - Opciones globales (language, style)                          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PASO 2: AGREGAR VIDEOS                                         │
+│  POST /v1/autoedit/project/{id}/videos                          │
+│  - Crear workflows para cada video                              │
+│  - Asociar al proyecto                                          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PASO 3: INICIAR BATCH PROCESSING                               │
+│  POST /v1/autoedit/project/{id}/start                           │
+│  - parallel_limit: cuántos videos procesar en paralelo          │
+│  - webhook_url: notificaciones de progreso                      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PASO 4: MONITOREAR PROGRESO                                    │
+│  GET /v1/autoedit/project/{id}/stats                            │
+│  - total_videos, completed, pending, failed                     │
+│  - Polling cada 5-10 segundos                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Ejemplos de Código
+
+#### Crear Proyecto
+
+```javascript
+const createProject = async (name, options = {}) => {
+  const response = await fetch(`${API_BASE_URL}/v1/autoedit/project`, {
+    method: 'POST',
+    headers: {
+      'X-API-Key': API_KEY,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      name,
+      description: options.description || '',
+      options: {
+        language: options.language || 'es',
+        style: options.style || 'dynamic'
+      }
+    })
+  });
+
+  const data = await response.json();
+  // IMPORTANTE: project_id está en data.response.project_id
+  return data.response;
+};
+
+// Uso
+const project = await createProject('Mi Proyecto de Videos', {
+  language: 'es',
+  style: 'dynamic'
+});
+console.log(project.project_id); // "proj_abc123..."
+```
+
+#### Agregar Videos al Proyecto
+
+```javascript
+const addVideosToProject = async (projectId, videoUrls) => {
+  // Primero crear workflows para cada video
+  const workflows = [];
+
+  for (const videoUrl of videoUrls) {
+    // Crear workflow asociado al proyecto
+    const wfResponse = await fetch(`${API_BASE_URL}/v1/autoedit/workflow`, {
+      method: 'POST',
+      headers: {
+        'X-API-Key': API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        video_url: videoUrl,
+        options: {
+          project_id: projectId  // Asociar al proyecto
+        }
+      })
+    });
+
+    const wfData = await wfResponse.json();
+    workflows.push(wfData.response.workflow_id);
+  }
+
+  // Agregar workflows al proyecto
+  const response = await fetch(`${API_BASE_URL}/v1/autoedit/project/${projectId}/videos`, {
+    method: 'POST',
+    headers: {
+      'X-API-Key': API_KEY,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      workflow_ids: workflows
+    })
+  });
+
+  return await response.json();
+};
+```
+
+#### Iniciar Batch Processing
+
+```javascript
+const startProjectProcessing = async (projectId, options = {}) => {
+  const response = await fetch(`${API_BASE_URL}/v1/autoedit/project/${projectId}/start`, {
+    method: 'POST',
+    headers: {
+      'X-API-Key': API_KEY,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      parallel_limit: options.parallelLimit || 3,  // Máx 3 videos simultáneos
+      webhook_url: options.webhookUrl || null
+    })
+  });
+
+  return await response.json();
+};
+```
+
+#### Monitorear Progreso
+
+```javascript
+const getProjectStats = async (projectId) => {
+  const response = await fetch(`${API_BASE_URL}/v1/autoedit/project/${projectId}/stats`, {
+    headers: { 'X-API-Key': API_KEY }
+  });
+
+  return await response.json();
+};
+
+// Response example:
+// {
+//   "project_id": "proj_abc123",
+//   "state": "processing",
+//   "stats": {
+//     "total_videos": 10,
+//     "completed": 3,
+//     "pending": 5,
+//     "processing": 2,
+//     "failed": 0,
+//     "total_original_duration_ms": 3600000,
+//     "total_result_duration_ms": 2160000,
+//     "avg_removal_percentage": 40.0
+//   }
+// }
+
+// Hook de React para polling
+function useProjectProgress(projectId, pollInterval = 5000) {
+  const [stats, setStats] = useState(null);
+  const [isComplete, setIsComplete] = useState(false);
+
+  useEffect(() => {
+    const poll = async () => {
+      const data = await getProjectStats(projectId);
+      setStats(data.stats);
+
+      if (['completed', 'partial_complete', 'failed'].includes(data.state)) {
+        setIsComplete(true);
+      }
+    };
+
+    poll(); // Initial fetch
+    const interval = setInterval(poll, pollInterval);
+
+    return () => clearInterval(interval);
+  }, [projectId, pollInterval]);
+
+  return { stats, isComplete };
+}
+```
+
+#### Listar Videos del Proyecto
+
+```javascript
+const getProjectVideos = async (projectId) => {
+  const response = await fetch(`${API_BASE_URL}/v1/autoedit/project/${projectId}/videos`, {
+    headers: { 'X-API-Key': API_KEY }
+  });
+
+  return await response.json();
+};
+
+// Response incluye cada workflow con su estado actual
+// Útil para mostrar tabla de progreso individual
+```
+
+### UI Recomendada para Proyectos
+
+```jsx
+function ProjectDashboard({ projectId }) {
+  const { stats, isComplete } = useProjectProgress(projectId);
+  const [videos, setVideos] = useState([]);
+
+  useEffect(() => {
+    getProjectVideos(projectId).then(setVideos);
+  }, [projectId]);
+
+  if (!stats) return <LoadingSpinner />;
+
+  const progress = (stats.completed / stats.total_videos) * 100;
+
+  return (
+    <div className="project-dashboard">
+      {/* Progress Bar */}
+      <div className="progress-bar">
+        <div
+          className="progress-fill"
+          style={{ width: `${progress}%` }}
+        />
+        <span>{stats.completed} / {stats.total_videos} videos</span>
+      </div>
+
+      {/* Stats Grid */}
+      <div className="stats-grid">
+        <StatCard label="Completados" value={stats.completed} color="green" />
+        <StatCard label="En Proceso" value={stats.processing} color="blue" />
+        <StatCard label="Pendientes" value={stats.pending} color="gray" />
+        <StatCard label="Fallidos" value={stats.failed} color="red" />
+      </div>
+
+      {/* Video List */}
+      <table className="video-list">
+        <thead>
+          <tr>
+            <th>Video</th>
+            <th>Estado</th>
+            <th>Duración Original</th>
+            <th>Duración Final</th>
+            <th>Acciones</th>
+          </tr>
+        </thead>
+        <tbody>
+          {videos.map(video => (
+            <tr key={video.workflow_id}>
+              <td>{video.filename || video.workflow_id}</td>
+              <td><StatusBadge status={video.status} /></td>
+              <td>{formatDuration(video.original_duration_ms)}</td>
+              <td>{formatDuration(video.result_duration_ms)}</td>
+              <td>
+                {video.status === 'pending_review_1' && (
+                  <button onClick={() => goToHITL1(video.workflow_id)}>
+                    Revisar XML
+                  </button>
+                )}
+                {video.status === 'pending_review_2' && (
+                  <button onClick={() => goToHITL2(video.workflow_id)}>
+                    Revisar Preview
+                  </button>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+```
+
+---
+
+## B-Roll Analysis (Fase 3)
+
+### ¿Qué es B-Roll?
+
+**B-Roll** son los segmentos de video que **no contienen diálogo principal**. Son tomas de apoyo que se usan para:
+
+- **Establishing shots**: Tomas que establecen ubicación o contexto
+- **Detail shots**: Primer plano de objetos o detalles
+- **Transition shots**: Tomas para transiciones suaves entre escenas
+- **Ambient shots**: Capturas del ambiente o entorno
+- **Action shots**: Acciones sin diálogo
+
+El análisis B-Roll identifica automáticamente estos segmentos usando **Gemini 2.5 Pro Vision**.
+
+### Cómo Funciona
+
+```
+Video → FFmpeg extrae frames → Gemini Vision analiza → JSON con segmentos B-Roll
+         (1 frame/2sec)         (identifica categorías)
+```
+
+### Obtener Datos de B-Roll
+
+Los datos de B-Roll están disponibles en el workflow después de que el análisis completa:
+
+```javascript
+const getWorkflowWithBRoll = async (workflowId) => {
+  const response = await fetch(`${API_BASE_URL}/v1/autoedit/workflow/${workflowId}`, {
+    headers: { 'X-API-Key': API_KEY }
+  });
+
+  const workflow = await response.json();
+
+  // B-Roll data
+  const brollSegments = workflow.broll_segments || [];
+  const brollComplete = workflow.broll_analysis_complete || false;
+
+  return { workflow, brollSegments, brollComplete };
+};
+```
+
+### Estructura de Segmento B-Roll
+
+```javascript
+{
+  "segment_id": "broll_001",
+  "inMs": 5720,              // Inicio en milisegundos
+  "outMs": 12450,            // Fin en milisegundos
+  "duration_ms": 6730,       // Duración
+  "type": "B-Roll",
+  "category": "establishing_shot",  // Categoría
+  "description": "Toma aérea de la ciudad al atardecer",
+  "confidence": 0.85,        // Confianza del análisis (0-1)
+  "scores": {
+    "technical_quality": 4,   // Calidad técnica (1-5)
+    "visual_appeal": 5,       // Atractivo visual (1-5)
+    "usefulness": 4           // Utilidad para edición (1-5)
+  },
+  "potential_use": ["Establecimiento", "Transición"]
+}
+```
+
+### Categorías de B-Roll
+
+| Categoría | Descripción | Uso Típico |
+|-----------|-------------|------------|
+| `establishing_shot` | Tomas amplias que establecen ubicación | Inicio de secciones |
+| `detail_shot` | Primer plano de objetos/detalles | Énfasis en productos |
+| `transition_shot` | Tomas neutrales para transiciones | Entre segmentos |
+| `ambient_shot` | Ambiente, paisajes, entorno | Relleno visual |
+| `action_shot` | Acciones sin diálogo | Demostraciones |
+| `nature_shot` | Naturaleza, exteriores | B-Roll genérico |
+| `graphic_overlay` | Gráficos, texto en pantalla | Títulos, lower thirds |
+
+### Integración en UI
+
+#### Timeline con B-Roll
+
+```jsx
+function TimelineWithBRoll({ blocks, gaps, brollSegments, videoDuration }) {
+  const getPositionPercent = (ms) => (ms / videoDuration) * 100;
+
+  return (
+    <div className="timeline-container">
+      {/* Track principal: A-Roll (blocks que se mantienen) */}
+      <div className="timeline-track track-aroll">
+        <label>A-Roll (Diálogo)</label>
+        {blocks.map(block => (
+          <div
+            key={block.id}
+            className="timeline-segment aroll"
+            style={{
+              left: `${getPositionPercent(block.inMs)}%`,
+              width: `${getPositionPercent(block.outMs - block.inMs)}%`
+            }}
+            title={block.text}
+          />
+        ))}
+      </div>
+
+      {/* Track secundario: B-Roll */}
+      <div className="timeline-track track-broll">
+        <label>B-Roll</label>
+        {brollSegments.map(segment => (
+          <div
+            key={segment.segment_id}
+            className={`timeline-segment broll ${segment.category}`}
+            style={{
+              left: `${getPositionPercent(segment.inMs)}%`,
+              width: `${getPositionPercent(segment.outMs - segment.inMs)}%`
+            }}
+            title={`${segment.category}: ${segment.description}`}
+          >
+            <span className="category-icon">
+              {getCategoryIcon(segment.category)}
+            </span>
+          </div>
+        ))}
+      </div>
+
+      {/* Track de gaps (segmentos eliminados) */}
+      <div className="timeline-track track-gaps">
+        <label>Eliminados</label>
+        {gaps.map(gap => (
+          <div
+            key={gap.id}
+            className="timeline-segment gap"
+            style={{
+              left: `${getPositionPercent(gap.inMs)}%`,
+              width: `${getPositionPercent(gap.outMs - gap.inMs)}%`
+            }}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function getCategoryIcon(category) {
+  const icons = {
+    establishing_shot: '🏙️',
+    detail_shot: '🔍',
+    transition_shot: '➡️',
+    ambient_shot: '🌅',
+    action_shot: '🎬',
+    nature_shot: '🌿',
+    graphic_overlay: '📝'
+  };
+  return icons[category] || '🎥';
+}
+```
+
+#### Estilos CSS para B-Roll
+
+```css
+.timeline-container {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.timeline-track {
+  position: relative;
+  height: 40px;
+  background: #1a1a2e;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.timeline-track label {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 10px;
+  color: #888;
+  z-index: 1;
+}
+
+.timeline-segment {
+  position: absolute;
+  height: 100%;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+/* A-Roll: Verde (contenido principal) */
+.timeline-segment.aroll {
+  background: linear-gradient(180deg, #4CAF50 0%, #388E3C 100%);
+}
+
+/* B-Roll: Azul (material de apoyo) */
+.timeline-segment.broll {
+  background: linear-gradient(180deg, #2196F3 0%, #1976D2 100%);
+}
+
+/* Categorías específicas de B-Roll */
+.timeline-segment.broll.establishing_shot {
+  background: linear-gradient(180deg, #9C27B0 0%, #7B1FA2 100%);
+}
+
+.timeline-segment.broll.detail_shot {
+  background: linear-gradient(180deg, #FF9800 0%, #F57C00 100%);
+}
+
+.timeline-segment.broll.transition_shot {
+  background: linear-gradient(180deg, #00BCD4 0%, #0097A7 100%);
+}
+
+/* Gaps: Rojo rayado */
+.timeline-segment.gap {
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(244, 67, 54, 0.3),
+    rgba(244, 67, 54, 0.3) 5px,
+    rgba(244, 67, 54, 0.1) 5px,
+    rgba(244, 67, 54, 0.1) 10px
+  );
+}
+
+.category-icon {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 12px;
+}
+```
+
+#### Panel de B-Roll Segments
+
+```jsx
+function BRollPanel({ segments, onSegmentClick, onUseSegment }) {
+  // Agrupar por categoría
+  const byCategory = segments.reduce((acc, seg) => {
+    if (!acc[seg.category]) acc[seg.category] = [];
+    acc[seg.category].push(seg);
+    return acc;
+  }, {});
+
+  return (
+    <div className="broll-panel">
+      <h3>B-Roll Disponible ({segments.length} segmentos)</h3>
+
+      {Object.entries(byCategory).map(([category, segs]) => (
+        <div key={category} className="broll-category">
+          <h4>{getCategoryIcon(category)} {formatCategory(category)}</h4>
+
+          <div className="segment-list">
+            {segs.map(seg => (
+              <div
+                key={seg.segment_id}
+                className="segment-card"
+                onClick={() => onSegmentClick(seg)}
+              >
+                <div className="segment-time">
+                  {formatTime(seg.inMs)} - {formatTime(seg.outMs)}
+                </div>
+                <div className="segment-description">
+                  {seg.description}
+                </div>
+                <div className="segment-scores">
+                  <span title="Calidad técnica">🎬 {seg.scores.technical_quality}/5</span>
+                  <span title="Atractivo visual">✨ {seg.scores.visual_appeal}/5</span>
+                  <span title="Utilidad">📊 {seg.scores.usefulness}/5</span>
+                </div>
+                <div className="segment-confidence">
+                  Confianza: {Math.round(seg.confidence * 100)}%
+                </div>
+                <button
+                  className="use-segment-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onUseSegment(seg);
+                  }}
+                >
+                  Usar como transición
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function formatCategory(category) {
+  const names = {
+    establishing_shot: 'Tomas de Establecimiento',
+    detail_shot: 'Detalles',
+    transition_shot: 'Transiciones',
+    ambient_shot: 'Ambiente',
+    action_shot: 'Acción',
+    nature_shot: 'Naturaleza',
+    graphic_overlay: 'Gráficos'
+  };
+  return names[category] || category;
+}
+```
+
+### Flujo Completo con B-Roll
+
+```javascript
+// Hook que combina workflow, blocks, y B-Roll
+function useAutoEditWithBRoll(workflowId) {
+  const [data, setData] = useState({
+    workflow: null,
+    blocks: [],
+    gaps: [],
+    brollSegments: [],
+    brollComplete: false
+  });
+
+  useEffect(() => {
+    const fetchData = async () => {
+      // 1. Obtener workflow con B-Roll
+      const wfResponse = await fetch(
+        `${API_BASE_URL}/v1/autoedit/workflow/${workflowId}`,
+        { headers: { 'X-API-Key': API_KEY } }
+      );
+      const workflow = await wfResponse.json();
+
+      // 2. Obtener preview data (blocks y gaps)
+      let blocks = [];
+      let gaps = [];
+      if (['pending_review_2', 'modifying_blocks', 'completed'].includes(workflow.status)) {
+        const previewResponse = await fetch(
+          `${API_BASE_URL}/v1/autoedit/workflow/${workflowId}/preview`,
+          { headers: { 'X-API-Key': API_KEY } }
+        );
+        const preview = await previewResponse.json();
+        blocks = preview.blocks || [];
+        gaps = preview.gaps || [];
+      }
+
+      setData({
+        workflow,
+        blocks,
+        gaps,
+        brollSegments: workflow.broll_segments || [],
+        brollComplete: workflow.broll_analysis_complete || false
+      });
+    };
+
+    fetchData();
+  }, [workflowId]);
+
+  return data;
+}
+```
+
+---
+
 ## Recursos Adicionales
 
 - [API Reference](./API-REFERENCE.md) - Documentación completa de endpoints
 - [Workflow States](./WORKFLOW-STATES.md) - Diagrama de estados
 - [MCP Integration](./MCP-INTEGRATION.md) - Integración con agentes AI
+- [CHANGELOG](./CHANGELOG.md) - Historial de cambios
