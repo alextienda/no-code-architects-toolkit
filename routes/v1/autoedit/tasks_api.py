@@ -554,3 +554,65 @@ def task_render():
         logger.error(traceback.format_exc())
         manager.set_status(workflow_id, "error", error=str(e))
         return jsonify({"error": str(e), "workflow_id": workflow_id}), 500
+
+
+# =============================================================================
+# TASK: ANALYZE B-ROLL (Visual Analysis with Gemini Vision)
+# =============================================================================
+@v1_autoedit_tasks_api_bp.route('/v1/autoedit/tasks/analyze-broll', methods=['POST'])
+@authenticate
+def task_analyze_broll():
+    """
+    Cloud Task handler for B-Roll visual analysis.
+
+    Extracts frames from video and sends to Gemini Vision for B-Roll identification.
+    Can run in parallel with A-Roll analysis.
+    """
+    from services.v1.autoedit.analyze_broll import analyze_workflow_broll
+
+    data = request.json or {}
+    workflow_id = data.get("workflow_id")
+
+    if not workflow_id:
+        return jsonify({"error": "workflow_id required"}), 400
+
+    logger.info(f"[TASK] Analyze B-Roll started for workflow {workflow_id}")
+
+    try:
+        manager = get_workflow_manager()
+        workflow = manager.get(workflow_id)
+
+        if not workflow:
+            return jsonify({"error": "Workflow not found", "workflow_id": workflow_id}), 404
+
+        # Run B-Roll analysis
+        result = analyze_workflow_broll(workflow_id)
+
+        if "error" in result:
+            logger.error(f"[TASK] Analyze B-Roll failed for {workflow_id}: {result['error']}")
+            return jsonify({
+                "status": "error",
+                "workflow_id": workflow_id,
+                "error": result["error"]
+            }), 500
+
+        # Get summary info
+        summary = result.get("analysis_summary", {})
+        segments = result.get("segments", [])
+
+        logger.info(f"[TASK] Analyze B-Roll completed for {workflow_id}: {len(segments)} segments found")
+
+        return jsonify({
+            "status": "broll_analyzed",
+            "workflow_id": workflow_id,
+            "segments_count": len(segments),
+            "total_broll_duration_ms": summary.get("total_broll_duration_ms", 0),
+            "broll_percentage": summary.get("broll_percentage", 0),
+            "message": "B-Roll analysis complete."
+        }), 200
+
+    except Exception as e:
+        logger.error(f"[TASK] Analyze B-Roll failed for {workflow_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e), "workflow_id": workflow_id}), 500

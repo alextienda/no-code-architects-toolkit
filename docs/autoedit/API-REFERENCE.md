@@ -2,7 +2,7 @@
 
 Documentación completa de la API REST para el pipeline de edición automática de video con AI.
 
-**Versión**: 1.2.0
+**Versión**: 1.3.0
 
 ---
 
@@ -1331,6 +1331,346 @@ Estimar tiempo de render para el workflow.
 
 ---
 
+## Multi-Video Projects (Fase 3)
+
+### Overview
+
+Los proyectos permiten agrupar múltiples videos para procesamiento batch. Cada proyecto contiene workflows (videos) que se procesan en paralelo.
+
+**Flujo típico:**
+1. Crear proyecto con nombre y opciones
+2. Agregar videos (crea workflows automáticamente)
+3. Iniciar batch processing
+4. Monitorear progreso con stats
+
+### POST /v1/autoedit/project
+
+Crear un nuevo proyecto multi-video.
+
+**Request Body:**
+
+```json
+{
+  "name": "Mi Proyecto de Videos",
+  "description": "Videos del evento 2025",
+  "options": {
+    "language": "es",
+    "style": "dynamic",
+    "auto_broll": true
+  }
+}
+```
+
+| Campo | Tipo | Requerido | Default | Descripción |
+|-------|------|-----------|---------|-------------|
+| `name` | string | Sí | - | Nombre del proyecto |
+| `description` | string | No | "" | Descripción |
+| `options.language` | string | No | "es" | Idioma para transcripción |
+| `options.style` | string | No | "dynamic" | Estilo de análisis |
+| `options.auto_broll` | boolean | No | false | Ejecutar análisis B-Roll |
+
+**Response (201 Created):**
+
+```json
+{
+  "status": "success",
+  "project_id": "proj_550e8400-...",
+  "name": "Mi Proyecto de Videos",
+  "state": "created",
+  "workflow_ids": [],
+  "stats": {
+    "total_videos": 0,
+    "completed": 0,
+    "pending": 0,
+    "failed": 0
+  }
+}
+```
+
+---
+
+### GET /v1/autoedit/project/{project_id}
+
+Obtener datos de un proyecto.
+
+**Response (200 OK):**
+
+```json
+{
+  "project_id": "proj_550e8400-...",
+  "name": "Mi Proyecto",
+  "description": "...",
+  "state": "processing",
+  "workflow_ids": ["wf_1", "wf_2", "wf_3"],
+  "options": {...},
+  "stats": {
+    "total_videos": 3,
+    "completed": 1,
+    "pending": 2,
+    "failed": 0,
+    "total_original_duration_ms": 180000,
+    "total_result_duration_ms": 108000,
+    "avg_removal_percentage": 40.0
+  },
+  "created_at": "2025-12-15T10:00:00Z",
+  "updated_at": "2025-12-15T11:30:00Z"
+}
+```
+
+---
+
+### GET /v1/autoedit/projects
+
+Listar todos los proyectos.
+
+**Query Parameters:**
+
+| Parámetro | Tipo | Descripción |
+|-----------|------|-------------|
+| `state` | string | Filtrar por estado (opcional) |
+| `limit` | integer | Máximo resultados (default: 100) |
+
+**Response (200 OK):**
+
+```json
+{
+  "projects": [
+    {
+      "project_id": "proj_...",
+      "name": "Proyecto 1",
+      "state": "completed",
+      "total_videos": 5,
+      "created_at": "..."
+    }
+  ],
+  "total": 3
+}
+```
+
+---
+
+### DELETE /v1/autoedit/project/{project_id}
+
+Eliminar un proyecto. **No elimina los workflows asociados.**
+
+**Query Parameters:**
+
+| Parámetro | Tipo | Default | Descripción |
+|-----------|------|---------|-------------|
+| `delete_workflows` | boolean | false | También eliminar workflows |
+
+**Response (200 OK):**
+
+```json
+{
+  "status": "success",
+  "message": "Project deleted",
+  "project_id": "proj_...",
+  "workflows_deleted": false
+}
+```
+
+---
+
+### POST /v1/autoedit/project/{project_id}/videos
+
+Agregar videos al proyecto. Crea workflows automáticamente.
+
+**Request Body:**
+
+```json
+{
+  "videos": [
+    {"video_url": "https://storage.example.com/video1.mp4"},
+    {"video_url": "https://storage.example.com/video2.mp4"}
+  ]
+}
+```
+
+**Response (201 Created):**
+
+```json
+{
+  "status": "success",
+  "workflows_created": [
+    {"workflow_id": "wf_1", "video_url": "https://..."},
+    {"workflow_id": "wf_2", "video_url": "https://..."}
+  ],
+  "total_videos": 5
+}
+```
+
+---
+
+### DELETE /v1/autoedit/project/{project_id}/videos/{workflow_id}
+
+Remover un video del proyecto. **No elimina el workflow.**
+
+**Response (200 OK):**
+
+```json
+{
+  "status": "success",
+  "message": "Video removed from project",
+  "workflow_id": "wf_...",
+  "note": "Workflow was NOT deleted"
+}
+```
+
+---
+
+### POST /v1/autoedit/project/{project_id}/start
+
+Iniciar batch processing para todos los videos pendientes.
+
+**Request Body:**
+
+```json
+{
+  "parallel_limit": 3,
+  "webhook_url": "https://mi-backend.com/project-complete"
+}
+```
+
+| Campo | Tipo | Default | Descripción |
+|-------|------|---------|-------------|
+| `parallel_limit` | integer | 3 | Videos a procesar en paralelo |
+| `webhook_url` | string | null | Webhook para notificaciones |
+
+**Response (202 Accepted):**
+
+```json
+{
+  "status": "success",
+  "message": "Started processing 5 video(s)",
+  "project_id": "proj_...",
+  "tasks_enqueued": 5,
+  "pending_workflows": 5,
+  "tasks": [
+    {"workflow_id": "wf_1", "task_name": "...", "delay_seconds": 0},
+    {"workflow_id": "wf_2", "task_name": "...", "delay_seconds": 0},
+    {"workflow_id": "wf_3", "task_name": "...", "delay_seconds": 0},
+    {"workflow_id": "wf_4", "task_name": "...", "delay_seconds": 5},
+    {"workflow_id": "wf_5", "task_name": "...", "delay_seconds": 5}
+  ]
+}
+```
+
+**Notas:**
+- Los videos se procesan en batches según `parallel_limit`
+- Cada batch tiene un delay de 5 segundos para evitar saturación
+- Hacer polling en `GET /project/{id}/stats` para monitorear progreso
+
+---
+
+### GET /v1/autoedit/project/{project_id}/stats
+
+Obtener estadísticas agregadas actualizadas.
+
+**Response (200 OK):**
+
+```json
+{
+  "status": "success",
+  "project_id": "proj_...",
+  "state": "processing",
+  "stats": {
+    "total_videos": 5,
+    "completed": 2,
+    "pending": 2,
+    "failed": 1,
+    "total_original_duration_ms": 300000,
+    "total_result_duration_ms": 180000,
+    "avg_removal_percentage": 40.0
+  }
+}
+```
+
+---
+
+## B-Roll Analysis (Fase 3)
+
+### Overview
+
+El análisis B-Roll utiliza Gemini Vision para identificar segmentos de video que **no contienen diálogo** (footage de apoyo visual).
+
+**Características:**
+- Extracción de frames (1 cada 2 segundos)
+- Análisis visual con Gemini 2.5 Pro Vision
+- Categorización automática (establishing, detail, transition, etc.)
+- Scoring de calidad técnica y utilidad
+
+**Flujo:**
+1. Se extraen frames del video con FFmpeg
+2. Frames se envían a Gemini Vision via Vertex AI
+3. Gemini identifica segmentos B-Roll
+4. Resultados se almacenan en el workflow
+
+### B-Roll Segment Structure
+
+```json
+{
+  "segment_id": "broll_001",
+  "inMs": 5720,
+  "outMs": 12450,
+  "duration_ms": 6730,
+  "type": "B-Roll",
+  "category": "establishing_shot",
+  "description": "Toma aérea de la ciudad al atardecer",
+  "scores": {
+    "technical_quality": 4,
+    "visual_appeal": 5,
+    "usefulness": 4,
+    "overall": 4
+  },
+  "potential_use": ["Establecimiento", "Intro"],
+  "has_motion": true,
+  "has_text_overlay": false,
+  "is_timelapse": false,
+  "confidence": 0.92
+}
+```
+
+### Categorías B-Roll
+
+| Categoría | Descripción | Ejemplos |
+|-----------|-------------|----------|
+| `establishing_shot` | Tomas amplias de ubicación | Fachadas, paisajes, vistas aéreas |
+| `detail_shot` | Close-ups de objetos | Manos, productos, pantallas |
+| `transition_shot` | Tomas para transiciones | Cielos, movimiento blur |
+| `ambient_shot` | Ambiente y contexto | Calles, gente caminando |
+| `action_shot` | Actividades sin diálogo | Escribiendo, cocinando |
+| `nature_shot` | Elementos naturales | Plantas, agua, animales |
+
+### Cloud Task: analyze-broll
+
+Este endpoint es llamado por Cloud Tasks (no directamente por el frontend).
+
+**Endpoint:** `POST /v1/autoedit/tasks/analyze-broll`
+
+**Request Body:**
+
+```json
+{
+  "workflow_id": "550e8400-..."
+}
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "status": "broll_analyzed",
+  "workflow_id": "550e8400-...",
+  "segments_count": 5,
+  "total_broll_duration_ms": 24500,
+  "broll_percentage": 13.6,
+  "message": "B-Roll analysis complete."
+}
+```
+
+---
+
 ## Schemas
 
 ### Block
@@ -1469,6 +1809,31 @@ Causas comunes:
 ---
 
 ## Changelog
+
+### v1.3.0 (2025-12) - Fase 3
+- **Multi-Video Projects**: Soporte para proyectos con múltiples videos
+  - CRUD completo de proyectos
+  - Batch processing con paralelización configurable
+  - Estadísticas agregadas por proyecto
+- **B-Roll Analysis**: Análisis visual con Gemini Vision
+  - Extracción de frames con FFmpeg
+  - Identificación automática de segmentos B-Roll
+  - Categorización: establishing, detail, transition, ambient, action shots
+  - Scoring de calidad técnica y utilidad (1-5)
+- **Nuevos Endpoints**:
+  - `POST /v1/autoedit/project` - Crear proyecto
+  - `GET /v1/autoedit/project/{id}` - Obtener proyecto
+  - `DELETE /v1/autoedit/project/{id}` - Eliminar proyecto
+  - `GET /v1/autoedit/projects` - Listar proyectos
+  - `POST /v1/autoedit/project/{id}/videos` - Agregar videos
+  - `DELETE /v1/autoedit/project/{id}/videos/{wf}` - Remover video
+  - `POST /v1/autoedit/project/{id}/start` - Iniciar batch processing
+  - `GET /v1/autoedit/project/{id}/stats` - Estadísticas
+  - `POST /v1/autoedit/tasks/analyze-broll` - Análisis B-Roll (Cloud Task)
+- **Campos Workflow Nuevos**:
+  - `project_id`: Asociación opcional con proyecto
+  - `broll_segments`: Segmentos B-Roll identificados
+  - `broll_analysis_complete`: Flag de análisis completado
 
 ### v1.2.0 (2025-01)
 - **Cloud Tasks Integration**: Orquestación asíncrona completa

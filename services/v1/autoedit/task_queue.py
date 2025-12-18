@@ -35,6 +35,7 @@ SERVICE_URL = os.environ.get("SERVICE_URL", "https://nca-toolkit-djwypu7xmq-uc.a
 TASK_TYPES = {
     "transcribe": "/v1/autoedit/tasks/transcribe",
     "analyze": "/v1/autoedit/tasks/analyze",
+    "analyze_broll": "/v1/autoedit/tasks/analyze-broll",  # B-Roll visual analysis
     "process": "/v1/autoedit/tasks/process",
     "preview": "/v1/autoedit/tasks/preview",
     "render": "/v1/autoedit/tasks/render"

@@ -5,6 +5,62 @@ All notable changes to the AutoEdit pipeline will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2025-12-16 - Fase 3: Multi-Video Projects + B-Roll Analysis
+
+### Added
+- **Multi-Video Projects**: Soporte para proyectos con múltiples videos
+  - `services/v1/autoedit/project.py`: ProjectManager con CRUD completo
+  - `routes/v1/autoedit/project_api.py`: 9 endpoints REST para gestión de proyectos
+  - Almacenamiento en GCS: `gs://{bucket}/projects/{project_id}.json`
+  - Batch processing con paralelización configurable
+  - Estadísticas agregadas por proyecto (videos totales, completados, fallidos)
+
+- **B-Roll Analysis con Gemini Vision**: Identificación automática de segmentos B-Roll
+  - `services/v1/autoedit/frame_extractor.py`: Extracción de frames con FFmpeg
+  - `services/v1/autoedit/analyze_broll.py`: Análisis visual con Gemini 2.5 Pro
+  - `infrastructure/prompts/autoedit_broll_prompt.txt`: System prompt especializado
+  - Categorización: establishing, detail, transition, ambient, action shots
+  - Scoring de calidad (1-5): technical_quality, visual_appeal, usefulness
+  - Filtrado automático: confidence >= 0.5, duration >= 2000ms
+
+- **Nuevos Endpoints de Proyecto**:
+  - `POST /v1/autoedit/project` - Crear proyecto
+  - `GET /v1/autoedit/project/{id}` - Obtener proyecto
+  - `DELETE /v1/autoedit/project/{id}` - Eliminar proyecto
+  - `GET /v1/autoedit/projects` - Listar proyectos
+  - `POST /v1/autoedit/project/{id}/videos` - Agregar videos
+  - `GET /v1/autoedit/project/{id}/videos` - Listar videos
+  - `DELETE /v1/autoedit/project/{id}/videos/{wf}` - Remover video
+  - `POST /v1/autoedit/project/{id}/start` - Iniciar batch processing
+  - `GET /v1/autoedit/project/{id}/stats` - Estadísticas
+
+- **Nuevo Cloud Task Handler**:
+  - `POST /v1/autoedit/tasks/analyze-broll` - Análisis B-Roll asíncrono
+
+- **Campos Workflow Nuevos**:
+  - `project_id`: Asociación opcional con proyecto (multi-video support)
+  - `broll_segments`: Array de segmentos B-Roll identificados
+  - `broll_analysis_complete`: Flag de análisis completado
+
+- **Tests Fase 3**: 38 tests estructurales en `tests/test_fase3_projects_broll.py`
+  - Tests de estructura de código
+  - Validación de archivos y funciones
+  - No requiere dependencias GCP para ejecutar
+
+### Changed
+- `services/v1/autoedit/workflow.py`: Agregados campos project_id, broll_segments, broll_analysis_complete
+- `services/v1/autoedit/task_queue.py`: Agregado task type `analyze_broll` y función `start_project_pipeline()`
+- `routes/v1/autoedit/tasks_api.py`: Agregado handler `task_analyze_broll()`
+
+### Technical Details
+- Frame extraction: 1 frame cada 2 segundos, máximo 30 frames
+- Frame resize: 1280px width (aspect ratio preserved)
+- Gemini Vision: Usa Vertex AI con gemini-2.5-pro
+- Batch processing: Staggered task enqueueing (5s delay entre batches)
+- Parallel limit: Configurable, default 3 videos simultáneos
+
+---
+
 ## [1.2.1] - 2024-12-13
 
 ### Changed
