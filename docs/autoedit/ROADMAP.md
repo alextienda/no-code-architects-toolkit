@@ -63,7 +63,65 @@ GET    /v1/autoedit/project/{id}/stats   - Estadísticas
 
 ---
 
-## Fase 4: AI Enhancements 🤖 FUTURO
+## Fase 4B: Multi-Video Context ✅ COMPLETADO (Diciembre 2024)
+
+### Logros
+- [x] **TwelveLabs Marengo 3.0 Integration** para embeddings de video
+- [x] **Context Builder** - Generación de contexto progresivo entre videos
+- [x] **Redundancy Detector** - Detección de contenido similar cross-video
+- [x] **Project Consolidation** - Orquestador del pipeline de consolidación
+- [x] **Context API** - 8 nuevos endpoints REST
+- [x] **Consolidation States** - Estados de consolidación en proyectos
+- [x] **Cloud Tasks Integration** - 3 nuevos tipos de tareas
+
+### Archivos Creados
+- `services/v1/autoedit/twelvelabs_embeddings.py` - Wrapper TwelveLabs API
+- `services/v1/autoedit/context_builder.py` - Generador de contexto
+- `services/v1/autoedit/redundancy_detector.py` - Detector de redundancias
+- `services/v1/autoedit/project_consolidation.py` - Orquestador
+- `routes/v1/autoedit/context_api.py` - Endpoints REST
+
+### Endpoints de Contexto
+```
+POST   /v1/autoedit/project/{id}/consolidate         - Ejecutar consolidación
+GET    /v1/autoedit/project/{id}/consolidation-status - Estado de consolidación
+GET    /v1/autoedit/project/{id}/redundancies        - Obtener redundancias
+GET    /v1/autoedit/project/{id}/narrative           - Análisis narrativo
+GET    /v1/autoedit/project/{id}/recommendations     - Recomendaciones de corte
+POST   /v1/autoedit/project/{id}/apply-recommendations - Aplicar recomendaciones
+PUT    /v1/autoedit/project/{id}/videos/reorder      - Reordenar videos
+GET    /v1/autoedit/project/{id}/context             - Contexto acumulado
+GET    /v1/autoedit/project/{id}/summaries           - Resúmenes de videos
+```
+
+### Estados de Consolidación
+- `not_started` - Consolidación no iniciada
+- `generating_embeddings` - Generando embeddings con TwelveLabs
+- `generating_summaries` - Generando resúmenes con Gemini
+- `detecting_redundancies` - Detectando redundancias cross-video
+- `analyzing_narrative` - Analizando estructura narrativa
+- `consolidating` - Ejecutando pipeline completo
+- `consolidated` - Consolidación completa, lista para revisión
+- `consolidation_complete` - Recomendaciones aplicadas
+- `consolidation_failed` - Proceso falló
+
+---
+
+## Fase 4A: Multi-Agent Pipeline 🔄 PLANIFICADO
+
+### Ideas
+- 3 agentes especializados en cadena:
+  - Agente 1: Limpieza técnica (muletillas, titubeos)
+  - Agente 2: Limpieza semántica (relleno, redundancias locales)
+  - Agente 3: Narrativo (storytelling, elegir "mejor versión")
+- Modo configurable: rápido (1 agente) vs calidad (3 agentes)
+
+### Prioridad: MEDIA
+### ETA: Q1 2025
+
+---
+
+## Fase 5: AI Enhancements 🤖 FUTURO
 
 ### Ideas
 - Auto-detection de segmentos relevantes
