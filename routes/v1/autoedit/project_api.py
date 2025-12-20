@@ -137,6 +137,16 @@ START_PROJECT_SCHEMA = {
             "type": "string",
             "format": "uri",
             "description": "Webhook URL for progress notifications"
+        },
+        "workflow_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional: specific workflow IDs to process (must belong to project)"
+        },
+        "include_failed": {
+            "type": "boolean",
+            "default": False,
+            "description": "Include failed workflows in processing (retry failed)"
         }
     },
     "additionalProperties": False
@@ -646,12 +656,16 @@ def start_project_endpoint(job_id, data, project_id=None):
 
         parallel_limit = data.get("parallel_limit", 3)
         webhook_url = data.get("webhook_url")
+        workflow_ids = data.get("workflow_ids")  # Optional: specific workflows to process
+        include_failed = data.get("include_failed", False)  # Include failed workflows
 
         # Start the batch pipeline
         result = start_project_pipeline(
             project_id=project_id,
             parallel_limit=parallel_limit,
-            webhook_url=webhook_url
+            webhook_url=webhook_url,
+            workflow_ids=workflow_ids,
+            include_failed=include_failed
         )
 
         # Update project state

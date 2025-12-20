@@ -379,7 +379,8 @@ def analyze_blocks_with_gemini(
     style: str = "dynamic",
     language: str = "es",
     model: str = "gemini-2.5-pro",
-    temperature: float = 0.0
+    temperature: float = 0.0,
+    context: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Main function: analyze text blocks with Gemini.
@@ -391,6 +392,7 @@ def analyze_blocks_with_gemini(
         language: Language code
         model: Gemini model to use
         temperature: Generation temperature
+        context: Optional multi-video context from previous videos in project
 
     Returns:
         Dict with analyzed blocks and metadata
@@ -398,13 +400,18 @@ def analyze_blocks_with_gemini(
     # Load the system prompt
     system_prompt = load_cleaner_prompt()
 
+    # Add multi-video context if provided
+    if context:
+        logger.info(f"Adding multi-video context to prompt ({len(context)} chars)")
+        system_prompt = context + "\n\n" + system_prompt
+
     # Optionally adjust prompt based on style
     if style == "conservative":
         system_prompt += "\n\n**NOTA ADICIONAL**: Sé conservador. Solo elimina relleno muy obvio."
     elif style == "aggressive":
         system_prompt += "\n\n**NOTA ADICIONAL**: Sé agresivo. Elimina todo lo que no sea absolutamente esencial."
 
-    logger.info(f"Analyzing {len(blocks)} blocks with Gemini (style: {style})")
+    logger.info(f"Analyzing {len(blocks)} blocks with Gemini (style: {style}, has_context: {context is not None})")
 
     # Call Gemini
     gemini_response = call_gemini_api(

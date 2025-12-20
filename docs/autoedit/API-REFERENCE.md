@@ -2,7 +2,7 @@
 
 Documentación completa de la API REST para el pipeline de edición automática de video con AI.
 
-**Versión**: 1.3.0
+**Versión**: 1.4.0
 
 ---
 
@@ -1521,45 +1521,90 @@ Remover un video del proyecto. **No elimina el workflow.**
 
 ### POST /v1/autoedit/project/{project_id}/start
 
-Iniciar batch processing para todos los videos pendientes.
+Iniciar batch processing para videos pendientes del proyecto.
 
 **Request Body:**
 
 ```json
 {
   "parallel_limit": 3,
-  "webhook_url": "https://mi-backend.com/project-complete"
+  "webhook_url": "https://mi-backend.com/project-complete",
+  "workflow_ids": ["wf_abc", "wf_def"],
+  "include_failed": false
 }
 ```
 
-| Campo | Tipo | Default | Descripción |
+| Campo | Tipo | Default | Descripcion |
 |-------|------|---------|-------------|
-| `parallel_limit` | integer | 3 | Videos a procesar en paralelo |
+| `parallel_limit` | integer | 3 | Videos a procesar en paralelo (1-10) |
 | `webhook_url` | string | null | Webhook para notificaciones |
+| `workflow_ids` | array | null | **Nuevo v1.4.1:** IDs especificos a procesar (deben pertenecer al proyecto) |
+| `include_failed` | boolean | false | **Nuevo v1.4.1:** Incluir workflows con status "error" (reintentar fallidos) |
+
+**Comportamiento de Filtrado:**
+
+- **Sin `workflow_ids`:** Procesa todos los workflows del proyecto con status "created"
+- **Con `workflow_ids`:** Solo procesa los IDs especificados (si tienen status "startable")
+- **Estados "startable":** `created` (y `error` si `include_failed=true`)
+- **Estados que se omiten:** `pending_review_1`, `pending_review_2`, `transcribing`, `analyzing`, `completed`, etc.
 
 **Response (202 Accepted):**
 
 ```json
 {
   "status": "success",
-  "message": "Started processing 5 video(s)",
+  "message": "Started processing 2 video(s)",
   "project_id": "proj_...",
-  "tasks_enqueued": 5,
-  "pending_workflows": 5,
+  "tasks_enqueued": 2,
+  "total_workflows": 5,
+  "pending_workflows": 2,
+  "skipped_count": 3,
+  "skipped_by_status": {
+    "pending_review_1": ["wf_1"],
+    "pending_review_2": ["wf_2", "wf_3"]
+  },
+  "invalid_workflow_ids": null,
   "tasks": [
-    {"workflow_id": "wf_1", "task_name": "...", "delay_seconds": 0},
-    {"workflow_id": "wf_2", "task_name": "...", "delay_seconds": 0},
-    {"workflow_id": "wf_3", "task_name": "...", "delay_seconds": 0},
-    {"workflow_id": "wf_4", "task_name": "...", "delay_seconds": 5},
-    {"workflow_id": "wf_5", "task_name": "...", "delay_seconds": 5}
+    {"workflow_id": "wf_4", "task_name": "...", "delay_seconds": 0},
+    {"workflow_id": "wf_5", "task_name": "...", "delay_seconds": 0}
   ]
 }
 ```
 
+| Campo Response | Descripcion |
+|----------------|-------------|
+| `tasks_enqueued` | Numero de tareas encoladas exitosamente |
+| `total_workflows` | Total de workflows en el proyecto |
+| `pending_workflows` | Workflows en estado "startable" |
+| `skipped_count` | Workflows omitidos (no en estado startable) |
+| `skipped_by_status` | Desglose de workflows omitidos por status |
+| `invalid_workflow_ids` | IDs de `workflow_ids` que no pertenecen al proyecto |
+
+**Casos de Uso:**
+
+1. **Procesar solo videos nuevos (comportamiento por defecto):**
+   ```json
+   {"parallel_limit": 3}
+   ```
+   Solo procesa workflows con status="created", omite los ya procesados.
+
+2. **Procesar workflows especificos:**
+   ```json
+   {"workflow_ids": ["wf_nuevo_1", "wf_nuevo_2"]}
+   ```
+   Util cuando el frontend sabe exactamente que videos procesar.
+
+3. **Reintentar videos fallidos:**
+   ```json
+   {"include_failed": true}
+   ```
+   Procesa workflows con status="created" y status="error".
+
 **Notas:**
-- Los videos se procesan en batches según `parallel_limit`
-- Cada batch tiene un delay de 5 segundos para evitar saturación
+- Los videos se procesan en batches segun `parallel_limit`
+- Cada batch tiene un delay de 5 segundos para evitar saturacion
 - Hacer polling en `GET /project/{id}/stats` para monitorear progreso
+- La respuesta `skipped_by_status` permite al frontend mostrar por que algunos videos no se procesaron
 
 ---
 
@@ -1668,6 +1713,354 @@ Este endpoint es llamado por Cloud Tasks (no directamente por el frontend).
   "message": "B-Roll analysis complete."
 }
 ```
+
+---
+
+## Multi-Video Context & Consolidation (Fase 4B)
+
+### Overview
+
+El sistema de contexto multi-video permite:
+- **Embeddings de Video**: Usando TwelveLabs Marengo 3.0 para similitud visual
+- **Contexto Progresivo**: Pasar contexto de videos analizados a videos posteriores
+- **Detección de Redundancias**: Identificar contenido similar entre videos
+- **Consolidación**: Análisis global de narrativa y recomendaciones de corte
+
+**Flujo típico:**
+1. Analizar todos los videos del proyecto (transcripción + Gemini)
+2. Ejecutar consolidación para generar embeddings y detectar redundancias
+3. Revisar recomendaciones (opcional HITL 3)
+4. Aplicar recomendaciones seleccionadas
+
+### POST /v1/autoedit/project/{project_id}/consolidate
+
+Ejecutar el pipeline de consolidación completo.
+
+**Request Body:**
+
+```json
+{
+  "force_regenerate": false,
+  "redundancy_threshold": 0.85,
+  "auto_apply": false,
+  "webhook_url": "https://mi-backend.com/consolidation-complete"
+}
+```
+
+| Campo | Tipo | Default | Descripción |
+|-------|------|---------|-------------|
+| `force_regenerate` | boolean | false | Regenerar embeddings/summaries aunque existan |
+| `redundancy_threshold` | float | 0.85 | Umbral de similitud para redundancia (0.5-1.0) |
+| `auto_apply` | boolean | false | Aplicar recomendaciones automáticamente (skip HITL 3) |
+| `webhook_url` | string | null | Webhook para notificación al completar |
+
+**Response (200 OK):**
+
+```json
+{
+  "success": true,
+  "project_id": "proj_...",
+  "consolidation": {
+    "status": "success",
+    "started_at": "2025-12-19T10:00:00Z",
+    "completed_at": "2025-12-19T10:02:30Z",
+    "workflow_count": 5,
+    "steps": {
+      "embeddings": {
+        "status": "success",
+        "generated": 3,
+        "existing": 2,
+        "failed": []
+      },
+      "summaries": {
+        "status": "success",
+        "generated": 5,
+        "existing": 0
+      },
+      "redundancies": {
+        "status": "success",
+        "redundancies_found": 4,
+        "recommendations_generated": 3,
+        "redundancy_score": 35.5
+      },
+      "narrative": {
+        "status": "success",
+        "arc_type": "complete",
+        "tone_consistency": 0.8
+      }
+    },
+    "recommendations": [...]
+  }
+}
+```
+
+---
+
+### GET /v1/autoedit/project/{project_id}/consolidation-status
+
+Obtener estado actual de consolidación.
+
+**Response (200 OK):**
+
+```json
+{
+  "success": true,
+  "project_id": "proj_...",
+  "consolidation_state": "consolidated",
+  "consolidation_updated_at": "2025-12-19T10:02:30Z",
+  "has_redundancy_analysis": true,
+  "has_project_context": true,
+  "redundancy_count": 4,
+  "topics_covered": 12
+}
+```
+
+---
+
+### GET /v1/autoedit/project/{project_id}/redundancies
+
+Obtener análisis de redundancias entre videos.
+
+**Query Parameters:**
+
+| Parámetro | Tipo | Descripción |
+|-----------|------|-------------|
+| `include_segments` | boolean | Incluir detalles de segmentos (default: false) |
+| `min_severity` | string | Filtrar por severidad mínima: high, medium, low |
+
+**Response (200 OK):**
+
+```json
+{
+  "success": true,
+  "project_id": "proj_...",
+  "redundancy_count": 4,
+  "redundancy_score": 35.5,
+  "interpretation": "Moderate redundancy - some repeated content detected",
+  "removable_duration_sec": 45.3,
+  "analyzed_at": "2025-12-19T10:02:00Z",
+  "redundancies_summary": [
+    {
+      "id": "red_abc123_def456_0",
+      "severity": "high",
+      "similarity": 0.95,
+      "video_a_index": 0,
+      "video_b_index": 2
+    }
+  ],
+  "recommendations": [...]
+}
+```
+
+---
+
+### GET /v1/autoedit/project/{project_id}/narrative
+
+Obtener análisis narrativo global del proyecto.
+
+**Response (200 OK):**
+
+```json
+{
+  "success": true,
+  "project_id": "proj_...",
+  "arc_type": "complete",
+  "narrative_functions": {
+    "introduction": 1,
+    "rising_action": 2,
+    "climax": 1,
+    "resolution": 1
+  },
+  "tone_consistency": 0.8,
+  "unique_tones": ["informativo", "entusiasta"],
+  "video_sequence": [
+    {
+      "index": 0,
+      "function": "introduction",
+      "tone": "informativo",
+      "summary": "Introducción al tema principal..."
+    }
+  ],
+  "analyzed_at": "2025-12-19T10:02:30Z"
+}
+```
+
+---
+
+### GET /v1/autoedit/project/{project_id}/recommendations
+
+Obtener recomendaciones de corte basadas en redundancias.
+
+**Query Parameters:**
+
+| Parámetro | Tipo | Descripción |
+|-----------|------|-------------|
+| `priority` | string | Filtrar por prioridad: high, medium, low |
+
+**Response (200 OK):**
+
+```json
+{
+  "success": true,
+  "project_id": "proj_...",
+  "recommendation_count": 3,
+  "total_savings_sec": 45.3,
+  "recommendations": [
+    {
+      "id": "rec_red_abc123_0",
+      "type": "remove_redundant_segment",
+      "priority": "high",
+      "action": {
+        "workflow_id": "wf_...",
+        "segment": {
+          "start_sec": 120.5,
+          "end_sec": 135.8,
+          "index": 5
+        }
+      },
+      "reason": "Similar content (95%) already in video 1",
+      "similarity": 0.95,
+      "estimated_savings_sec": 15.3,
+      "keep_reference": {
+        "workflow_id": "wf_first...",
+        "segment": {...}
+      }
+    }
+  ]
+}
+```
+
+---
+
+### POST /v1/autoedit/project/{project_id}/apply-recommendations
+
+Aplicar recomendaciones de corte a los workflows.
+
+**Request Body:**
+
+```json
+{
+  "recommendation_ids": ["rec_1", "rec_2"],
+  "webhook_url": "https://..."
+}
+```
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `recommendation_ids` | array | IDs específicos a aplicar (vacío = todos) |
+| `webhook_url` | string | Webhook para notificación |
+
+**Response (200 OK):**
+
+```json
+{
+  "success": true,
+  "project_id": "proj_...",
+  "status": "success",
+  "applied_count": 2,
+  "failed_count": 0,
+  "applied": ["rec_1", "rec_2"],
+  "failed": []
+}
+```
+
+---
+
+### PUT /v1/autoedit/project/{project_id}/videos/reorder
+
+Reordenar videos en la secuencia del proyecto.
+
+**Request Body:**
+
+```json
+{
+  "workflow_ids": ["wf_3", "wf_1", "wf_2"]
+}
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "success": true,
+  "project_id": "proj_...",
+  "workflow_ids": ["wf_3", "wf_1", "wf_2"],
+  "message": "Videos reordered successfully"
+}
+```
+
+**Nota:** Reordenar invalida la consolidación existente (requiere re-consolidar).
+
+---
+
+### GET /v1/autoedit/project/{project_id}/context
+
+Obtener contexto acumulado del proyecto.
+
+**Response (200 OK):**
+
+```json
+{
+  "success": true,
+  "project_id": "proj_...",
+  "covered_topics": ["tema1", "tema2", "tema3"],
+  "entities_introduced": ["lugar1", "persona1"],
+  "narrative_functions": {
+    "introduction": 1,
+    "rising_action": 2
+  },
+  "total_videos": 5,
+  "updated_at": "2025-12-19T10:02:30Z"
+}
+```
+
+---
+
+### GET /v1/autoedit/project/{project_id}/summaries
+
+Obtener resúmenes de todos los videos del proyecto.
+
+**Response (200 OK):**
+
+```json
+{
+  "success": true,
+  "project_id": "proj_...",
+  "summary_count": 5,
+  "summaries": [
+    {
+      "workflow_id": "wf_...",
+      "sequence_index": 0,
+      "summary": "Resumen del video...",
+      "key_points": ["punto1", "punto2"],
+      "entities_mentioned": ["entidad1"],
+      "topics_covered": ["tema1"],
+      "narrative_function": "introduction",
+      "emotional_tone": "informativo",
+      "created_at": "2025-12-19T10:01:00Z"
+    }
+  ]
+}
+```
+
+---
+
+### Consolidation States
+
+| Estado | Descripción |
+|--------|-------------|
+| `not_started` | Consolidación no iniciada |
+| `generating_embeddings` | Generando embeddings con TwelveLabs |
+| `generating_summaries` | Generando resúmenes con Gemini |
+| `detecting_redundancies` | Detectando redundancias cross-video |
+| `analyzing_narrative` | Analizando estructura narrativa |
+| `consolidating` | Ejecutando pipeline completo |
+| `consolidated` | Consolidación completa, lista para revisión |
+| `review_consolidation` | Usuario revisando recomendaciones |
+| `applying_recommendations` | Aplicando cortes recomendados |
+| `consolidation_complete` | Recomendaciones aplicadas |
+| `consolidation_failed` | Proceso falló |
+| `invalidated` | Consolidación invalidada (videos reordenados/agregados) |
 
 ---
 
@@ -1809,6 +2202,29 @@ Causas comunes:
 ---
 
 ## Changelog
+
+### v1.4.0 (2025-12) - Fase 4B
+- **Multi-Video Context**: Sistema de contexto progresivo entre videos
+  - TwelveLabs Marengo 3.0 para video embeddings
+  - Context Builder para resúmenes semánticos por video
+  - Contexto acumulado mejora análisis de videos posteriores
+- **Redundancy Detection**: Detección de contenido similar cross-video
+  - Similitud coseno con umbral configurable (default 0.85)
+  - Categorización de severidad: high (>0.9), medium (>0.8), low (>0.7)
+  - Generación automática de recomendaciones de corte
+- **Project Consolidation**: Pipeline completo de consolidación
+  - Análisis narrativo global (arc type, tone consistency)
+  - HITL 3 opcional para revisión de recomendaciones
+- **Nuevos Endpoints**:
+  - `POST /v1/autoedit/project/{id}/consolidate` - Ejecutar consolidación
+  - `GET /v1/autoedit/project/{id}/consolidation-status` - Estado de consolidación
+  - `GET /v1/autoedit/project/{id}/redundancies` - Obtener redundancias
+  - `GET /v1/autoedit/project/{id}/narrative` - Análisis narrativo
+  - `GET /v1/autoedit/project/{id}/recommendations` - Recomendaciones de corte
+  - `POST /v1/autoedit/project/{id}/apply-recommendations` - Aplicar recomendaciones
+  - `PUT /v1/autoedit/project/{id}/videos/reorder` - Reordenar videos
+  - `GET /v1/autoedit/project/{id}/context` - Contexto acumulado
+  - `GET /v1/autoedit/project/{id}/summaries` - Resúmenes de videos
 
 ### v1.3.0 (2025-12) - Fase 3
 - **Multi-Video Projects**: Soporte para proyectos con múltiples videos

@@ -5,6 +5,112 @@ All notable changes to the AutoEdit pipeline will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2025-12-19 - Workflow Filtering for Project Start
+
+### Added
+- **Workflow Filtering**: Parametros opcionales para controlar que workflows procesar
+  - `workflow_ids`: Array opcional de IDs especificos a procesar
+  - `include_failed`: Boolean para incluir workflows con status "error" (retry)
+
+- **Enhanced Response**: Respuesta mejorada con detalles de filtrado
+  - `skipped_count`: Numero de workflows omitidos
+  - `skipped_by_status`: Desglose de workflows omitidos por status
+  - `invalid_workflow_ids`: IDs que no pertenecen al proyecto
+
+### Changed
+- `POST /v1/autoedit/project/{id}/start`: Nuevos parametros opcionales
+  - Backward compatible: sin parametros nuevos, comportamiento identico
+  - Frontend puede especificar exactamente que videos procesar
+  - Respuesta incluye razon por la que workflows fueron omitidos
+
+### Technical Details
+- Solo workflows con status "created" son procesados por defecto
+- Con `include_failed=true`, tambien procesa status "error"
+- Validacion de que `workflow_ids` pertenezcan al proyecto
+- 22 tests estructurales en `tests/test_workflow_filtering.py`
+
+---
+
+## [1.4.0] - 2025-12-19 - Fase 4B: Multi-Video Context & Consolidation
+
+### Added
+- **TwelveLabs Marengo 3.0 Integration**: Video embeddings para similitud visual cross-video
+  - `services/v1/autoedit/twelvelabs_embeddings.py`: Wrapper para TwelveLabs API
+  - Soporte para embeddings síncronos y asíncronos
+  - Caché local de embeddings en GCS
+
+- **Context Builder**: Sistema de contexto progresivo entre videos
+  - `services/v1/autoedit/context_builder.py`: Generador de contexto para análisis
+  - Resúmenes semánticos de cada video con Gemini
+  - Contexto acumulado para mejorar análisis de videos posteriores
+  - Tracking de temas cubiertos, entidades introducidas, funciones narrativas
+
+- **Redundancy Detector**: Detección de contenido similar cross-video
+  - `services/v1/autoedit/redundancy_detector.py`: Comparación de embeddings
+  - Similitud coseno con umbral configurable (default 0.85)
+  - Categorización de severidad: high (>0.9), medium (>0.8), low (>0.7)
+  - Generación automática de recomendaciones de corte
+
+- **Project Consolidation**: Orquestador del pipeline de consolidación
+  - `services/v1/autoedit/project_consolidation.py`: Pipeline completo
+  - Análisis narrativo global (arc type, tone consistency)
+  - Estados de consolidación granulares (10 estados)
+
+- **Context API**: 9 nuevos endpoints REST
+  - `routes/v1/autoedit/context_api.py`: Endpoints de contexto
+  - `POST /project/{id}/consolidate` - Ejecutar consolidación
+  - `GET /project/{id}/consolidation-status` - Estado de consolidación
+  - `GET /project/{id}/redundancies` - Obtener redundancias
+  - `GET /project/{id}/narrative` - Análisis narrativo
+  - `GET /project/{id}/recommendations` - Recomendaciones de corte
+  - `POST /project/{id}/apply-recommendations` - Aplicar recomendaciones
+  - `PUT /project/{id}/videos/reorder` - Reordenar videos
+  - `GET /project/{id}/context` - Contexto acumulado
+  - `GET /project/{id}/summaries` - Resúmenes de videos
+
+- **Cloud Tasks Integration**: 3 nuevos tipos de tareas
+  - `generate_embeddings` - Generación de embeddings TwelveLabs
+  - `generate_summaries` - Generación de resúmenes Gemini
+  - `consolidate_project` - Pipeline de consolidación completo
+
+- **Tests Fase 4B**: 68 tests estructurales en `tests/test_fase4b_multicontext.py`
+  - Tests de estructura de código sin dependencias externas
+  - Validación de funciones, imports, y configuración
+
+### Changed
+- `services/v1/autoedit/project.py`:
+  - Nuevo campo `consolidation_state` para tracking de consolidación
+  - Nuevo campo `consolidation_updated_at` para timestamps
+- `services/v1/autoedit/task_queue.py`:
+  - Nuevos task types para consolidación
+  - Funciones para encolar tareas de embeddings/summaries
+- `services/v1/autoedit/analyze_edit.py`:
+  - Nuevo parámetro `context` para contexto multi-video
+  - Prompt modificado para incluir contexto de videos anteriores
+
+### Consolidation States
+- `not_started` - Consolidación no iniciada
+- `generating_embeddings` - Generando embeddings con TwelveLabs
+- `generating_summaries` - Generando resúmenes con Gemini
+- `detecting_redundancies` - Detectando redundancias cross-video
+- `analyzing_narrative` - Analizando estructura narrativa
+- `consolidating` - Ejecutando pipeline completo
+- `consolidated` - Consolidación completa, lista para revisión
+- `review_consolidation` - Usuario revisando recomendaciones (HITL 3)
+- `applying_recommendations` - Aplicando cortes recomendados
+- `consolidation_complete` - Recomendaciones aplicadas
+- `consolidation_failed` - Proceso falló
+- `invalidated` - Consolidación invalidada (videos modificados)
+
+### Technical Details
+- TwelveLabs API: Marengo 3.0 model para video embeddings
+- Embedding dimensions: 1024 floats por video
+- Cosine similarity para comparación de embeddings
+- Context prompt: ~500 tokens adicionales por video procesado
+- Redundancy threshold: Configurable 0.5-1.0, default 0.85
+
+---
+
 ## [1.3.0] - 2025-12-16 - Fase 3: Multi-Video Projects + B-Roll Analysis
 
 ### Added

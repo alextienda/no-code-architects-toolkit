@@ -38,7 +38,11 @@ TASK_TYPES = {
     "analyze_broll": "/v1/autoedit/tasks/analyze-broll",  # B-Roll visual analysis
     "process": "/v1/autoedit/tasks/process",
     "preview": "/v1/autoedit/tasks/preview",
-    "render": "/v1/autoedit/tasks/render"
+    "render": "/v1/autoedit/tasks/render",
+    # Multi-video context tasks (Fase 4B)
+    "generate_embeddings": "/v1/autoedit/tasks/generate-embeddings",
+    "generate_summary": "/v1/autoedit/tasks/generate-summary",
+    "consolidate": "/v1/autoedit/tasks/consolidate"
 }
 
 # Pipeline flow: what task comes after each task
@@ -259,26 +263,31 @@ def continue_after_hitl2(workflow_id: str, quality: str = "high", crossfade_dura
 def start_project_pipeline(
     project_id: str,
     parallel_limit: int = 3,
-    webhook_url: Optional[str] = None
+    webhook_url: Optional[str] = None,
+    workflow_ids: Optional[list] = None,
+    include_failed: bool = False
 ) -> Dict[str, Any]:
     """
-    Start batch processing for all videos in a project.
+    Start batch processing for videos in a project.
 
-    Enqueues transcription tasks for all pending workflows in the project.
+    Enqueues transcription tasks for workflows in "startable" states.
+    Only processes workflows with status "created" (or "error" if include_failed=True).
     Tasks are staggered to respect parallel_limit.
 
     Args:
         project_id: The project ID to process
         parallel_limit: Max workflows to process in parallel (default 3)
         webhook_url: Optional webhook for progress notifications
+        workflow_ids: Optional list of specific workflow IDs to process (must belong to project)
+        include_failed: If True, also process workflows with status "error" (retry failed)
 
     Returns:
-        Result dict with tasks_enqueued count and details
+        Result dict with tasks_enqueued count, skipped details, and errors
     """
     from services.v1.autoedit.project import get_project
     from services.v1.autoedit.workflow import get_workflow
 
-    logger.info(f"Starting batch pipeline for project {project_id} (parallel_limit={parallel_limit})")
+    logger.info(f"Starting batch pipeline for project {project_id} (parallel_limit={parallel_limit}, include_failed={include_failed})")
 
     project = get_project(project_id)
     if not project:
@@ -288,8 +297,8 @@ def start_project_pipeline(
             "project_id": project_id
         }
 
-    workflow_ids = project.get("workflow_ids", [])
-    if not workflow_ids:
+    project_workflow_ids = project.get("workflow_ids", [])
+    if not project_workflow_ids:
         return {
             "success": False,
             "error": "No videos in project",
@@ -301,17 +310,54 @@ def start_project_pipeline(
     language = project_options.get("language", "es")
     style = project_options.get("style", "dynamic")
 
+    # Define startable states
+    startable_states = ["created"]
+    if include_failed:
+        startable_states.append("error")
+
+    # Determine target workflows
+    invalid_workflow_ids = []
+    if workflow_ids:
+        # Filter to only workflows that belong to this project
+        target_workflow_ids = []
+        for wf_id in workflow_ids:
+            if wf_id in project_workflow_ids:
+                target_workflow_ids.append(wf_id)
+            else:
+                invalid_workflow_ids.append(wf_id)
+        if invalid_workflow_ids:
+            logger.warning(f"Invalid workflow_ids (not in project): {invalid_workflow_ids}")
+    else:
+        # Use all project workflows
+        target_workflow_ids = project_workflow_ids
+
     tasks_enqueued = []
     errors = []
 
-    # Filter to only pending workflows (status = created)
+    # Filter by status and track skipped workflows
     pending_workflows = []
-    for wf_id in workflow_ids:
-        wf = get_workflow(wf_id)
-        if wf and wf.get("status") == "created":
-            pending_workflows.append(wf_id)
+    skipped_by_status = {}
 
-    logger.info(f"Project {project_id}: {len(pending_workflows)} pending workflows out of {len(workflow_ids)} total")
+    for wf_id in target_workflow_ids:
+        wf = get_workflow(wf_id)
+        if not wf:
+            errors.append({"workflow_id": wf_id, "error": "Workflow not found"})
+            continue
+
+        status = wf.get("status", "unknown")
+        if status in startable_states:
+            pending_workflows.append(wf_id)
+        else:
+            # Group skipped workflows by status
+            if status not in skipped_by_status:
+                skipped_by_status[status] = []
+            skipped_by_status[status].append(wf_id)
+
+    logger.info(
+        f"Project {project_id}: {len(pending_workflows)} startable workflows, "
+        f"{sum(len(v) for v in skipped_by_status.values())} skipped, "
+        f"out of {len(target_workflow_ids)} target workflows"
+    )
 
     # Enqueue tasks with staggered delays for parallel processing
     for i, workflow_id in enumerate(pending_workflows):
@@ -350,12 +396,18 @@ def start_project_pipeline(
                 "error": str(e)
             })
 
+    # Build enhanced response
+    skipped_count = sum(len(v) for v in skipped_by_status.values())
+
     return {
-        "success": len(tasks_enqueued) > 0,
+        "success": len(tasks_enqueued) > 0 or (len(pending_workflows) == 0 and skipped_count > 0),
         "project_id": project_id,
         "tasks_enqueued": len(tasks_enqueued),
-        "total_workflows": len(workflow_ids),
+        "total_workflows": len(project_workflow_ids),
         "pending_workflows": len(pending_workflows),
+        "skipped_count": skipped_count,
+        "skipped_by_status": skipped_by_status if skipped_by_status else None,
+        "invalid_workflow_ids": invalid_workflow_ids if invalid_workflow_ids else None,
         "tasks": tasks_enqueued,
         "errors": errors if errors else None
     }
@@ -407,3 +459,199 @@ def enqueue_task_local(
             "task_type": task_type,
             "workflow_id": workflow_id
         }
+
+
+# ============================================================================
+# Multi-Video Context Task Functions (Fase 4B)
+# ============================================================================
+
+def enqueue_embeddings_task(
+    workflow_id: str,
+    project_id: Optional[str] = None,
+    video_url: Optional[str] = None,
+    video_duration_sec: Optional[float] = None
+) -> Dict[str, Any]:
+    """
+    Enqueue a task to generate video embeddings using TwelveLabs.
+
+    Args:
+        workflow_id: The workflow ID
+        project_id: Optional project ID for context
+        video_url: Video URL (if not in workflow)
+        video_duration_sec: Known duration to choose sync/async
+
+    Returns:
+        Task enqueueing result
+    """
+    logger.info(f"Enqueuing embeddings task for workflow {workflow_id}")
+
+    return enqueue_task(
+        task_type="generate_embeddings",
+        workflow_id=workflow_id,
+        payload={
+            "project_id": project_id,
+            "video_url": video_url,
+            "video_duration_sec": video_duration_sec
+        }
+    )
+
+
+def enqueue_summary_task(
+    workflow_id: str,
+    project_id: str,
+    sequence_index: int
+) -> Dict[str, Any]:
+    """
+    Enqueue a task to generate video summary for context.
+
+    Args:
+        workflow_id: The workflow ID
+        project_id: The project ID
+        sequence_index: Video position in project sequence
+
+    Returns:
+        Task enqueueing result
+    """
+    logger.info(f"Enqueuing summary task for workflow {workflow_id} (seq {sequence_index})")
+
+    return enqueue_task(
+        task_type="generate_summary",
+        workflow_id=workflow_id,
+        payload={
+            "project_id": project_id,
+            "sequence_index": sequence_index
+        }
+    )
+
+
+def enqueue_consolidation_task(
+    project_id: str,
+    force_regenerate: bool = False,
+    redundancy_threshold: float = 0.85,
+    auto_apply: bool = False,
+    webhook_url: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Enqueue a project consolidation task.
+
+    This will:
+    1. Generate embeddings for all videos (if needed)
+    2. Generate summaries (if needed)
+    3. Detect cross-video redundancies
+    4. Analyze narrative structure
+    5. Generate recommendations
+
+    Args:
+        project_id: The project ID
+        force_regenerate: Force regeneration of embeddings/summaries
+        redundancy_threshold: Similarity threshold (default: 0.85)
+        auto_apply: Auto-apply recommendations (skip HITL 3)
+        webhook_url: Webhook for async notification
+
+    Returns:
+        Task enqueueing result
+    """
+    logger.info(f"Enqueuing consolidation task for project {project_id}")
+
+    return enqueue_task(
+        task_type="consolidate",
+        workflow_id=f"project_{project_id}",  # Use project ID as workflow_id
+        payload={
+            "project_id": project_id,
+            "force_regenerate": force_regenerate,
+            "redundancy_threshold": redundancy_threshold,
+            "auto_apply": auto_apply,
+            "webhook_url": webhook_url
+        }
+    )
+
+
+def start_project_embeddings(
+    project_id: str,
+    parallel_limit: int = 2
+) -> Dict[str, Any]:
+    """
+    Generate embeddings for all videos in a project.
+
+    Args:
+        project_id: The project ID
+        parallel_limit: Max concurrent embedding tasks
+
+    Returns:
+        Result with tasks enqueued
+    """
+    from services.v1.autoedit.project import get_project, update_project
+    from services.v1.autoedit.workflow import get_workflow
+    from services.v1.autoedit.twelvelabs_embeddings import load_embeddings_from_gcs
+
+    logger.info(f"Starting embeddings generation for project {project_id}")
+
+    project = get_project(project_id)
+    if not project:
+        return {
+            "success": False,
+            "error": "Project not found",
+            "project_id": project_id
+        }
+
+    # Update consolidation state
+    update_project(project_id, {"consolidation_state": "generating_embeddings"})
+
+    workflow_ids = project.get("workflow_ids", [])
+    tasks_enqueued = []
+    already_have = []
+    errors = []
+
+    for i, wf_id in enumerate(workflow_ids):
+        # Check if embeddings already exist
+        existing = load_embeddings_from_gcs(wf_id)
+        if existing:
+            already_have.append(wf_id)
+            continue
+
+        # Get workflow for video URL and duration
+        wf = get_workflow(wf_id)
+        if not wf:
+            errors.append({"workflow_id": wf_id, "error": "Workflow not found"})
+            continue
+
+        video_url = wf.get("video_url")
+        duration = wf.get("stats", {}).get("original_duration_ms", 0) / 1000
+
+        # Stagger tasks
+        batch_number = len(tasks_enqueued) // parallel_limit
+        delay_seconds = batch_number * 10  # 10 second stagger
+
+        try:
+            result = enqueue_task(
+                task_type="generate_embeddings",
+                workflow_id=wf_id,
+                payload={
+                    "project_id": project_id,
+                    "video_url": video_url,
+                    "video_duration_sec": duration
+                },
+                delay_seconds=delay_seconds
+            )
+
+            if result.get("success"):
+                tasks_enqueued.append({
+                    "workflow_id": wf_id,
+                    "task_name": result.get("task_name"),
+                    "delay_seconds": delay_seconds
+                })
+            else:
+                errors.append({"workflow_id": wf_id, "error": result.get("error")})
+
+        except Exception as e:
+            errors.append({"workflow_id": wf_id, "error": str(e)})
+
+    return {
+        "success": True,
+        "project_id": project_id,
+        "tasks_enqueued": len(tasks_enqueued),
+        "already_have_embeddings": len(already_have),
+        "total_workflows": len(workflow_ids),
+        "tasks": tasks_enqueued,
+        "errors": errors if errors else None
+    }

@@ -616,3 +616,254 @@ def task_analyze_broll():
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({"error": str(e), "workflow_id": workflow_id}), 500
+
+
+# =============================================================================
+# TASK: GENERATE EMBEDDINGS (Multi-Video Context - Fase 4B)
+# =============================================================================
+@v1_autoedit_tasks_api_bp.route('/v1/autoedit/tasks/generate-embeddings', methods=['POST'])
+@authenticate
+def task_generate_embeddings():
+    """
+    Cloud Task handler for generating video embeddings with TwelveLabs.
+
+    Generates Marengo 3.0 embeddings for cross-video similarity detection.
+    """
+    from services.v1.autoedit.twelvelabs_embeddings import (
+        create_video_embeddings,
+        save_embeddings_to_gcs
+    )
+
+    data = request.json or {}
+    workflow_id = data.get("workflow_id")
+    project_id = data.get("project_id")
+    video_url = data.get("video_url")
+    video_duration_sec = data.get("video_duration_sec")
+
+    if not workflow_id:
+        return jsonify({"error": "workflow_id required"}), 400
+
+    logger.info(f"[TASK] Generate embeddings started for workflow {workflow_id}")
+
+    try:
+        manager = get_workflow_manager()
+        workflow = manager.get(workflow_id)
+
+        if not workflow:
+            return jsonify({"error": "Workflow not found", "workflow_id": workflow_id}), 404
+
+        # Get video URL if not provided
+        if not video_url:
+            video_url = workflow.get("video_url")
+        if not video_url:
+            return jsonify({"error": "No video URL available", "workflow_id": workflow_id}), 400
+
+        # Get duration if not provided
+        if not video_duration_sec:
+            video_duration_sec = workflow.get("stats", {}).get("original_duration_ms", 0) / 1000
+
+        # Generate embeddings
+        result = create_video_embeddings(
+            video_url=video_url,
+            video_duration_sec=video_duration_sec,
+            wait_for_result=True
+        )
+
+        if not result.get("success"):
+            error = result.get("error", "Unknown error")
+            logger.error(f"[TASK] Embeddings failed for {workflow_id}: {error}")
+            return jsonify({
+                "status": "error",
+                "workflow_id": workflow_id,
+                "error": error
+            }), 500
+
+        # Save embeddings to GCS
+        gcs_path = save_embeddings_to_gcs(workflow_id, result)
+
+        # Update workflow with embeddings info
+        manager.update(workflow_id, {
+            "embeddings_path": gcs_path,
+            "embeddings_count": len(result.get("embeddings", [])),
+            "embeddings_model": result.get("model", "marengo3.0")
+        })
+
+        logger.info(f"[TASK] Embeddings completed for {workflow_id}: {len(result.get('embeddings', []))} vectors")
+
+        return jsonify({
+            "status": "embeddings_generated",
+            "workflow_id": workflow_id,
+            "embeddings_count": len(result.get("embeddings", [])),
+            "segments_count": len(result.get("segments", [])),
+            "gcs_path": gcs_path
+        }), 200
+
+    except Exception as e:
+        logger.error(f"[TASK] Generate embeddings failed for {workflow_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e), "workflow_id": workflow_id}), 500
+
+
+# =============================================================================
+# TASK: GENERATE SUMMARY (Multi-Video Context - Fase 4B)
+# =============================================================================
+@v1_autoedit_tasks_api_bp.route('/v1/autoedit/tasks/generate-summary', methods=['POST'])
+@authenticate
+def task_generate_summary():
+    """
+    Cloud Task handler for generating video summary for context.
+
+    Generates a semantic summary using Gemini to pass as context
+    to subsequent video analyses.
+    """
+    from services.v1.autoedit.context_builder import (
+        generate_video_summary,
+        save_video_summary
+    )
+
+    data = request.json or {}
+    workflow_id = data.get("workflow_id")
+    project_id = data.get("project_id")
+    sequence_index = data.get("sequence_index", 0)
+
+    if not workflow_id:
+        return jsonify({"error": "workflow_id required"}), 400
+    if not project_id:
+        return jsonify({"error": "project_id required"}), 400
+
+    logger.info(f"[TASK] Generate summary started for workflow {workflow_id} (seq {sequence_index})")
+
+    try:
+        manager = get_workflow_manager()
+        workflow = manager.get(workflow_id)
+
+        if not workflow:
+            return jsonify({"error": "Workflow not found", "workflow_id": workflow_id}), 404
+
+        # Get transcript
+        transcript_internal = workflow.get("transcript_internal", [])
+        transcript_text = " ".join(w.get("text", "") for w in transcript_internal)
+
+        if not transcript_text:
+            return jsonify({
+                "error": "No transcript available",
+                "workflow_id": workflow_id
+            }), 400
+
+        # Generate summary
+        summary = generate_video_summary(
+            workflow_id=workflow_id,
+            transcript_text=transcript_text,
+            gemini_xml=workflow.get("gemini_xml"),
+            sequence_index=sequence_index
+        )
+
+        # Save summary
+        gcs_path = save_video_summary(project_id, workflow_id, summary)
+
+        logger.info(f"[TASK] Summary completed for {workflow_id}: {len(summary.get('key_points', []))} key points")
+
+        return jsonify({
+            "status": "summary_generated",
+            "workflow_id": workflow_id,
+            "project_id": project_id,
+            "sequence_index": sequence_index,
+            "key_points_count": len(summary.get("key_points", [])),
+            "narrative_function": summary.get("narrative_function", "unknown"),
+            "gcs_path": gcs_path
+        }), 200
+
+    except Exception as e:
+        logger.error(f"[TASK] Generate summary failed for {workflow_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e), "workflow_id": workflow_id}), 500
+
+
+# =============================================================================
+# TASK: CONSOLIDATE (Multi-Video Context - Fase 4B)
+# =============================================================================
+@v1_autoedit_tasks_api_bp.route('/v1/autoedit/tasks/consolidate', methods=['POST'])
+@authenticate
+def task_consolidate():
+    """
+    Cloud Task handler for project consolidation.
+
+    Runs the full consolidation pipeline:
+    1. Generate embeddings (if needed)
+    2. Generate summaries (if needed)
+    3. Detect cross-video redundancies
+    4. Analyze narrative structure
+    5. Generate recommendations
+    """
+    from services.v1.autoedit.project_consolidation import consolidate_project
+    from services.v1.autoedit.project import get_project, update_project
+
+    data = request.json or {}
+    project_id = data.get("project_id")
+    force_regenerate = data.get("force_regenerate", False)
+    redundancy_threshold = data.get("redundancy_threshold", 0.85)
+    auto_apply = data.get("auto_apply", False)
+    webhook_url = data.get("webhook_url")
+
+    if not project_id:
+        return jsonify({"error": "project_id required"}), 400
+
+    logger.info(f"[TASK] Consolidation started for project {project_id}")
+
+    try:
+        # Verify project exists
+        project = get_project(project_id)
+        if not project:
+            return jsonify({"error": "Project not found", "project_id": project_id}), 404
+
+        # Update consolidation state
+        update_project(project_id, {"consolidation_state": "consolidating"})
+
+        # Run consolidation
+        results = consolidate_project(
+            project_id=project_id,
+            force_regenerate=force_regenerate,
+            redundancy_threshold=redundancy_threshold,
+            auto_apply=auto_apply
+        )
+
+        status = results.get("status", "unknown")
+        logger.info(f"[TASK] Consolidation completed for {project_id}: {status}")
+
+        # Send webhook if configured
+        if webhook_url and status == "success":
+            try:
+                import requests as http_requests
+                http_requests.post(
+                    webhook_url,
+                    json={
+                        "project_id": project_id,
+                        "status": "consolidated",
+                        "redundancy_count": results.get("steps", {}).get("redundancies", {}).get("redundancies_found", 0),
+                        "recommendations": results.get("recommendations", [])
+                    },
+                    timeout=30
+                )
+            except Exception as webhook_error:
+                logger.warning(f"Failed to send consolidation webhook: {webhook_error}")
+
+        return jsonify({
+            "status": status,
+            "project_id": project_id,
+            "consolidation_results": results
+        }), 200
+
+    except Exception as e:
+        logger.error(f"[TASK] Consolidation failed for {project_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+        # Update project state
+        try:
+            update_project(project_id, {"consolidation_state": "consolidation_failed"})
+        except:
+            pass
+
+        return jsonify({"error": str(e), "project_id": project_id}), 500

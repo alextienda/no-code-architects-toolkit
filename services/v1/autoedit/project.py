@@ -43,6 +43,22 @@ PROJECT_STATES = {
     "error": "Project error"
 }
 
+# Consolidation states (for multi-video context analysis)
+CONSOLIDATION_STATES = {
+    "not_started": "Consolidation not yet initiated",
+    "generating_embeddings": "Generating video embeddings with TwelveLabs",
+    "generating_summaries": "Generating video summaries with Gemini",
+    "detecting_redundancies": "Detecting cross-video redundancies",
+    "analyzing_narrative": "Analyzing global narrative structure",
+    "consolidating": "Running full consolidation pipeline",
+    "consolidated": "Consolidation complete, ready for review",
+    "review_consolidation": "User reviewing consolidation recommendations",
+    "applying_recommendations": "Applying recommended cuts",
+    "consolidation_complete": "Consolidation applied successfully",
+    "consolidation_failed": "Consolidation process failed",
+    "invalidated": "Consolidation invalidated (videos reordered/added/removed)"
+}
+
 # Default TTL: 7 days for projects (longer than workflows)
 DEFAULT_PROJECT_TTL_HOURS = 168
 
@@ -151,7 +167,19 @@ class ProjectManager:
 
             # Error tracking
             "error": None,
-            "error_details": None
+            "error_details": None,
+
+            # Consolidation (multi-video context analysis)
+            "consolidation_state": "not_started",
+            "consolidation_state_message": CONSOLIDATION_STATES["not_started"],
+            "consolidation_updated_at": None,
+            "consolidation_options": {
+                "redundancy_threshold": 0.85,
+                "auto_apply": False,
+                "generate_embeddings": True,
+                "generate_summaries": True
+            },
+            "consolidation_results": None  # Stores last consolidation results
         }
 
         self._save(project_id, project_data)
@@ -246,6 +274,11 @@ class ProjectManager:
             # Update state message if state changed
             if "state" in updates and updates["state"] in PROJECT_STATES:
                 data["state_message"] = PROJECT_STATES[updates["state"]]
+
+            # Update consolidation state message if consolidation_state changed
+            if "consolidation_state" in updates and updates["consolidation_state"] in CONSOLIDATION_STATES:
+                data["consolidation_state_message"] = CONSOLIDATION_STATES[updates["consolidation_state"]]
+                data["consolidation_updated_at"] = datetime.utcnow().isoformat()
 
             try:
                 success = self._save(project_id, data, if_generation_match=generation)
