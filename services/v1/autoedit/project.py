@@ -118,7 +118,8 @@ class ProjectManager:
         self,
         name: str,
         description: Optional[str] = None,
-        options: Optional[Dict[str, Any]] = None
+        options: Optional[Dict[str, Any]] = None,
+        project_context: Optional[Dict[str, Any]] = None
     ) -> str:
         """Create a new project.
 
@@ -126,6 +127,9 @@ class ProjectManager:
             name: Project name (e.g., "Viaje a México")
             description: Optional project description
             options: Optional project configuration (language, style, etc.)
+            project_context: Optional creator profile overrides for this project.
+                Can include: campaign, sponsor, specific_audience, tone_override,
+                style_override, focus, call_to_action, keywords_to_keep, keywords_to_avoid
 
         Returns:
             project_id: Unique identifier for the project
@@ -151,6 +155,10 @@ class ProjectManager:
                 "style": "dynamic",
                 **(options or {})
             },
+
+            # Creator profile overrides for this project
+            # Merged with CREATOR_GLOBAL_PROFILE when generating prompts
+            "project_context": project_context or {},
 
             # Aggregated statistics
             "stats": {
@@ -660,9 +668,26 @@ def get_project_manager() -> ProjectManager:
 # CONVENIENCE FUNCTIONS
 # =============================================================================
 
-def create_project(name: str, description: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
-    """Create a new project (convenience function)."""
-    return get_project_manager().create(name, description, options)
+def create_project(
+    name: str,
+    description: Optional[str] = None,
+    options: Optional[Dict[str, Any]] = None,
+    project_context: Optional[Dict[str, Any]] = None
+) -> str:
+    """Create a new project (convenience function).
+
+    Args:
+        name: Project name
+        description: Optional description
+        options: Optional project options (language, style, etc.)
+        project_context: Optional creator profile overrides for this project.
+            Can include: campaign, sponsor, specific_audience, tone_override,
+            style_override, focus, call_to_action, keywords_to_keep, keywords_to_avoid
+
+    Returns:
+        project_id
+    """
+    return get_project_manager().create(name, description, options, project_context)
 
 
 def get_project(project_id: str) -> Optional[Dict[str, Any]]:

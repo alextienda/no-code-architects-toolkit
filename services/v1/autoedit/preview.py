@@ -29,7 +29,8 @@ from services.v1.autoedit.ffmpeg_builder import (
     build_preview_payload,
     build_final_render_payload,
     blocks_to_cuts,
-    estimate_render_time
+    estimate_render_time,
+    get_video_dimensions_from_url
 )
 from services.v1.autoedit.blocks import (
     calculate_gaps,
@@ -52,7 +53,9 @@ def generate_preview(
     video_duration_ms: int,
     transcript_words: Optional[List[Dict[str, Any]]] = None,
     quality: str = "480p",
-    fade_duration: float = 0.025
+    fade_duration: float = 0.025,
+    video_width: Optional[int] = None,
+    video_height: Optional[int] = None
 ) -> Dict[str, Any]:
     """Generate a low-resolution preview video.
 
@@ -64,11 +67,19 @@ def generate_preview(
         transcript_words: Optional transcript for gap text extraction
         quality: Preview quality ('480p' or '720p')
         fade_duration: Crossfade duration in seconds
+        video_width: Original video width (for aspect ratio preservation)
+        video_height: Original video height (for aspect ratio preservation)
 
     Returns:
         Dict with preview_url, blocks, gaps, and stats
     """
     start_time = time.time()
+
+    # Get video dimensions if not provided (for aspect ratio preservation)
+    if video_width is None or video_height is None:
+        logger.info(f"Getting video dimensions for aspect ratio preservation...")
+        video_width, video_height = get_video_dimensions_from_url(video_url)
+        logger.info(f"Video dimensions: {video_width}x{video_height}")
 
     # Ensure blocks have IDs
     blocks = ensure_block_ids(blocks)
@@ -79,12 +90,14 @@ def generate_preview(
     if not cuts:
         raise ValueError("No valid cuts to preview")
 
-    # Build FFmpeg payload for preview
+    # Build FFmpeg payload for preview (with aspect ratio preservation)
     payload = build_preview_payload(
         video_url=video_url,
         cuts=cuts,
         quality=quality,
-        fade_duration=fade_duration
+        fade_duration=fade_duration,
+        video_width=video_width,
+        video_height=video_height
     )
 
     logger.info(f"Generating preview for workflow {workflow_id} with {len(cuts)} cuts")
@@ -120,7 +133,9 @@ def generate_final_render(
     blocks: List[Dict[str, Any]],
     video_duration_ms: int,
     quality: str = "high",
-    fade_duration: float = 0.025
+    fade_duration: float = 0.025,
+    video_width: Optional[int] = None,
+    video_height: Optional[int] = None
 ) -> Dict[str, Any]:
     """Generate the final high-quality render.
 
@@ -131,11 +146,19 @@ def generate_final_render(
         video_duration_ms: Total video duration in milliseconds
         quality: Output quality ('standard', 'high', '4k')
         fade_duration: Crossfade duration in seconds
+        video_width: Original video width (for aspect ratio preservation)
+        video_height: Original video height (for aspect ratio preservation)
 
     Returns:
         Dict with output_url and stats
     """
     start_time = time.time()
+
+    # Get video dimensions if not provided (for aspect ratio preservation)
+    if video_width is None or video_height is None:
+        logger.info(f"Getting video dimensions for aspect ratio preservation...")
+        video_width, video_height = get_video_dimensions_from_url(video_url)
+        logger.info(f"Video dimensions: {video_width}x{video_height}")
 
     # Convert blocks to cuts
     cuts = blocks_to_cuts(blocks)
@@ -143,12 +166,14 @@ def generate_final_render(
     if not cuts:
         raise ValueError("No valid cuts to render")
 
-    # Build FFmpeg payload for final render
+    # Build FFmpeg payload for final render (with aspect ratio preservation)
     payload = build_final_render_payload(
         video_url=video_url,
         cuts=cuts,
         quality=quality,
-        fade_duration=fade_duration
+        fade_duration=fade_duration,
+        video_width=video_width,
+        video_height=video_height
     )
 
     logger.info(f"Starting final render for workflow {workflow_id} with {len(cuts)} cuts at {quality} quality")

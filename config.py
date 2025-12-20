@@ -43,3 +43,56 @@ def validate_env_vars(provider):
     missing_vars = [var for var in required_vars[provider] if not os.getenv(var)]
     if missing_vars:
         raise ValueError(f"Missing environment variables for {provider} storage: {', '.join(missing_vars)}")
+
+
+# =============================================================================
+# AUTOEDIT: CREATOR GLOBAL PROFILE
+# =============================================================================
+# This profile is used by AutoEdit prompts to personalize content for the creator.
+# Each field can be overridden via environment variables.
+# Per-project overrides can be set in project.project_context when creating projects.
+
+CREATOR_GLOBAL_PROFILE = {
+    # Creator's name (used instead of "el orador" in summaries)
+    "name": os.environ.get("CREATOR_NAME", "Alex"),
+
+    # Brand description
+    "brand": os.environ.get(
+        "CREATOR_BRAND",
+        "Contenido educativo de aviación y tecnología"
+    ),
+
+    # Target audience description
+    "audience": os.environ.get(
+        "CREATOR_AUDIENCE",
+        "Estudiantes de piloto, entusiastas de aviación, tech enthusiasts"
+    ),
+
+    # Content style
+    "style": os.environ.get(
+        "CREATOR_STYLE",
+        "Didáctico, técnico pero accesible, práctico"
+    ),
+
+    # Communication tone
+    "tone": os.environ.get(
+        "CREATOR_TONE",
+        "Informativo, profesional, cercano"
+    ),
+
+    # Typical content types (comma-separated, parsed to list)
+    "typical_content": [
+        x.strip() for x in os.environ.get(
+            "CREATOR_CONTENT_TYPES",
+            "tutoriales técnicos, explicaciones de conceptos, cursos"
+        ).split(",")
+    ],
+
+    # Things to avoid in content (comma-separated, parsed to list)
+    "avoid": [
+        x.strip() for x in os.environ.get(
+            "CREATOR_AVOID",
+            "humor forzado, clickbait, contenido superficial"
+        ).split(",")
+    ]
+}

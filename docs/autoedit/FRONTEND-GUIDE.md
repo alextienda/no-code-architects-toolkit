@@ -563,6 +563,26 @@ const getPreviewData = async (workflowId) => {
 // }
 ```
 
+> **Nota de Aspect Ratio (v1.5.0+):** El preview ahora preserva el aspect ratio original del video. Si el video es vertical (9:16), el preview sera vertical. Si es horizontal (16:9), el preview sera horizontal. El workflow almacena `original_width` y `original_height` para referencia. Asegure que su reproductor de video use `object-fit: contain` para mostrar correctamente cualquier aspect ratio.
+
+```css
+/* Recomendado para video player */
+.video-player video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+/* Container responsivo que se adapta al aspect ratio */
+.video-container {
+  position: relative;
+  width: 100%;
+  max-width: 800px;
+  aspect-ratio: auto;  /* O el aspect ratio del video original */
+}
+```
+
 ### Componente de Timeline
 
 ```jsx
@@ -1778,7 +1798,9 @@ const createProject = async (name, options = {}) => {
       options: {
         language: options.language || 'es',
         style: options.style || 'dynamic'
-      }
+      },
+      // v1.5.0: Contexto específico del proyecto
+      project_context: options.projectContext || undefined
     })
   });
 
@@ -1787,12 +1809,104 @@ const createProject = async (name, options = {}) => {
   return data.response;
 };
 
-// Uso
+// Uso básico
 const project = await createProject('Mi Proyecto de Videos', {
   language: 'es',
   style: 'dynamic'
 });
 console.log(project.project_id); // "proj_abc123..."
+
+// v1.5.0: Uso con project_context para personalización
+const projectWithContext = await createProject('Curso METAR Avanzado', {
+  language: 'es',
+  style: 'dynamic',
+  projectContext: {
+    campaign: 'Curso PPL 2025',
+    sponsor: 'Jeppesen',
+    specific_audience: 'Estudiantes de piloto privado',
+    tone_override: 'más técnico',
+    focus: 'terminología meteorológica precisa',
+    keywords_to_keep: ['METAR', 'TAF', 'SIGMET', 'NOTAM'],
+    creator_name: 'Capitán Alex'
+  }
+});
+```
+
+#### Project Context (v1.5.0)
+
+El campo `project_context` permite personalizar cómo el AI analiza y limpia el contenido para este proyecto específico:
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `campaign` | string | Nombre de campaña o partnership |
+| `sponsor` | string | Nombre del sponsor (se preservará en contenido) |
+| `specific_audience` | string | Audiencia específica para este proyecto |
+| `tone_override` | enum | Override del tono: "más técnico", "más casual", "más formal", "más energético" |
+| `style_override` | string | Override del estilo de edición |
+| `focus` | string | Enfoque específico para el análisis |
+| `call_to_action` | string | Call to action que debe preservarse |
+| `keywords_to_keep` | array | Palabras clave que NO deben eliminarse |
+| `keywords_to_avoid` | array | Palabras clave que DEBEN eliminarse |
+| `creator_name` | string | Nombre del creador (en lugar del default "Alex") |
+
+**Ejemplo de UI para capturar project_context:**
+
+```jsx
+function ProjectContextForm({ onSubmit }) {
+  const [context, setContext] = useState({});
+
+  return (
+    <form onSubmit={(e) => { e.preventDefault(); onSubmit(context); }}>
+      <h3>Contexto del Proyecto (Opcional)</h3>
+
+      <label>
+        Sponsor:
+        <input
+          value={context.sponsor || ''}
+          onChange={(e) => setContext({...context, sponsor: e.target.value})}
+          placeholder="Nombre del sponsor"
+        />
+      </label>
+
+      <label>
+        Audiencia Específica:
+        <input
+          value={context.specific_audience || ''}
+          onChange={(e) => setContext({...context, specific_audience: e.target.value})}
+          placeholder="ej: Estudiantes de piloto privado"
+        />
+      </label>
+
+      <label>
+        Tono:
+        <select
+          value={context.tone_override || ''}
+          onChange={(e) => setContext({...context, tone_override: e.target.value || undefined})}
+        >
+          <option value="">-- Usar default --</option>
+          <option value="más técnico">Más Técnico</option>
+          <option value="más casual">Más Casual</option>
+          <option value="más formal">Más Formal</option>
+          <option value="más energético">Más Energético</option>
+        </select>
+      </label>
+
+      <label>
+        Keywords a Mantener (separados por coma):
+        <input
+          value={(context.keywords_to_keep || []).join(', ')}
+          onChange={(e) => setContext({
+            ...context,
+            keywords_to_keep: e.target.value.split(',').map(k => k.trim()).filter(k => k)
+          })}
+          placeholder="METAR, TAF, NOTAM"
+        />
+      </label>
+
+      <button type="submit">Crear Proyecto</button>
+    </form>
+  );
+}
 ```
 
 #### Agregar Videos al Proyecto
@@ -1841,6 +1955,16 @@ const addVideosToProject = async (projectId, videoUrls) => {
 #### Iniciar Batch Processing
 
 ```javascript
+/**
+ * Inicia el procesamiento de videos en un proyecto.
+ *
+ * @param {string} projectId - ID del proyecto
+ * @param {Object} options - Opciones de procesamiento
+ * @param {number} options.parallelLimit - Máximo videos simultáneos (1-10, default: 3)
+ * @param {string} options.webhookUrl - URL para notificaciones
+ * @param {string[]} options.workflowIds - (v1.4.1) IDs específicos a procesar
+ * @param {boolean} options.includeFailed - (v1.4.1) Incluir workflows fallidos para reintentar
+ */
 const startProjectProcessing = async (projectId, options = {}) => {
   const response = await fetch(`${API_BASE_URL}/v1/autoedit/project/${projectId}/start`, {
     method: 'POST',
@@ -1849,13 +1973,100 @@ const startProjectProcessing = async (projectId, options = {}) => {
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      parallel_limit: options.parallelLimit || 3,  // Máx 3 videos simultáneos
-      webhook_url: options.webhookUrl || null
+      parallel_limit: options.parallelLimit || 3,
+      webhook_url: options.webhookUrl || null,
+      // Nuevos parámetros v1.4.1:
+      workflow_ids: options.workflowIds || undefined,  // Array de IDs específicos
+      include_failed: options.includeFailed || false   // Reintentar fallidos
     })
   });
 
   return await response.json();
 };
+
+// Ejemplo: Procesar solo videos nuevos (comportamiento por defecto)
+await startProjectProcessing('proj_abc', { parallelLimit: 3 });
+
+// Ejemplo: Procesar workflows específicos
+await startProjectProcessing('proj_abc', {
+  workflowIds: ['wf_nuevo_1', 'wf_nuevo_2']  // Solo estos
+});
+
+// Ejemplo: Reintentar videos fallidos
+await startProjectProcessing('proj_abc', {
+  includeFailed: true  // Procesa created + error
+});
+```
+
+#### Respuesta Mejorada (v1.4.1)
+
+La respuesta ahora incluye información detallada sobre qué workflows fueron omitidos y por qué:
+
+```javascript
+// Response example:
+{
+  "status": "success",
+  "message": "Started processing 2 video(s)",
+  "project_id": "proj_abc123",
+  "tasks_enqueued": 2,        // Cuántos se iniciaron
+  "total_workflows": 5,        // Total en el proyecto
+  "pending_workflows": 2,      // En estado "startable"
+  "skipped_count": 3,          // Cuántos se omitieron
+  "skipped_by_status": {       // ⬅️ Nuevo: Desglose por estado
+    "pending_review_1": ["wf_1"],
+    "pending_review_2": ["wf_2", "wf_3"]
+  },
+  "invalid_workflow_ids": null,  // IDs que no pertenecen al proyecto
+  "tasks": [
+    {"workflow_id": "wf_4", "task_name": "...", "delay_seconds": 0},
+    {"workflow_id": "wf_5", "task_name": "...", "delay_seconds": 0}
+  ]
+}
+```
+
+#### UI Recomendada: Mostrar Workflows Omitidos
+
+```jsx
+function StartProjectButton({ projectId, onStart }) {
+  const [result, setResult] = useState(null);
+
+  const handleStart = async () => {
+    const res = await startProjectProcessing(projectId, { parallelLimit: 3 });
+    setResult(res);
+    onStart?.(res);
+  };
+
+  return (
+    <div>
+      <button onClick={handleStart}>Iniciar Procesamiento</button>
+
+      {result && (
+        <div className="start-result">
+          <p>✅ {result.tasks_enqueued} videos iniciados</p>
+
+          {result.skipped_count > 0 && (
+            <div className="skipped-info">
+              <p>⏭️ {result.skipped_count} videos omitidos:</p>
+              <ul>
+                {Object.entries(result.skipped_by_status || {}).map(([status, ids]) => (
+                  <li key={status}>
+                    <strong>{status}:</strong> {ids.length} video(s)
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {result.tasks_enqueued === 0 && (
+            <p className="no-pending">
+              Todos los videos ya están en proceso o completados
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 ```
 
 #### Monitorear Progreso
@@ -2355,9 +2566,898 @@ function useAutoEditWithBRoll(workflowId) {
 
 ---
 
+## Multi-Video Context & Consolidation (Fase 4B)
+
+### Concepto
+
+La **Consolidación Multi-Video** analiza todos los videos de un proyecto en conjunto para:
+
+1. **Generar embeddings** de video con TwelveLabs Marengo 3.0
+2. **Detectar redundancias** entre videos (contenido similar)
+3. **Analizar narrativa global** del proyecto
+4. **Generar recomendaciones** de qué eliminar
+5. **Aplicar recomendaciones** automáticamente o con revisión humana (HITL 3)
+
+### Estados de Consolidación
+
+```
+not_started → generating_embeddings → generating_summaries → detecting_redundancies
+                                                                     │
+                                                                     ▼
+                                                          analyzing_narrative
+                                                                     │
+                                                                     ▼
+                                                              consolidating
+                                                                     │
+                                                                     ▼
+                                                              consolidated
+                                                                     │
+                                            ┌──────────────────────────────────┐
+                                            ▼                                  ▼
+                                  review_consolidation              consolidation_complete
+                                  (HITL 3 opcional)                  (auto-aplicado)
+```
+
+| Estado | Descripción |
+|--------|-------------|
+| `not_started` | Consolidación no iniciada |
+| `generating_embeddings` | Generando embeddings con TwelveLabs |
+| `generating_summaries` | Generando resúmenes con Gemini |
+| `detecting_redundancies` | Detectando contenido similar |
+| `analyzing_narrative` | Analizando arco narrativo global |
+| `consolidating` | Ejecutando pipeline completo |
+| `consolidated` | Listo para revisión |
+| `review_consolidation` | Usuario revisando recomendaciones |
+| `applying_recommendations` | Aplicando cortes recomendados |
+| `consolidation_complete` | Proceso completado |
+| `consolidation_failed` | Error en consolidación |
+| `invalidated` | Consolidación inválida (videos reordenados) |
+
+### Flujo de Consolidación
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  PASO 1: ASEGURAR QUE TODOS LOS VIDEOS ESTÁN ANALIZADOS                     │
+│  - Verificar que cada workflow esté en pending_review_1 o posterior         │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  PASO 2: INICIAR CONSOLIDACIÓN                                              │
+│  POST /v1/autoedit/project/{id}/consolidate                                 │
+│  - force_regenerate: true para regenerar embeddings                         │
+│  - auto_apply: true para aplicar automáticamente (sin HITL 3)               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  PASO 3: MONITOREAR PROGRESO                                                │
+│  GET /v1/autoedit/project/{id}/consolidation-status                         │
+│  - Polling cada 5 segundos                                                  │
+│  - Esperar estado "consolidated" o "consolidation_complete"                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  PASO 4: REVISAR RESULTADOS                                                 │
+│  GET /v1/autoedit/project/{id}/redundancies                                 │
+│  GET /v1/autoedit/project/{id}/narrative                                    │
+│  GET /v1/autoedit/project/{id}/recommendations                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  PASO 5 (HITL 3 OPCIONAL): REVISAR Y APLICAR                                │
+│  - Mostrar recomendaciones al usuario                                       │
+│  - Usuario puede aceptar/rechazar cada una                                  │
+│  POST /v1/autoedit/project/{id}/apply-recommendations                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Ejemplos de Código
+
+#### Iniciar Consolidación
+
+```javascript
+const startConsolidation = async (projectId, options = {}) => {
+  const response = await fetch(`${API_BASE_URL}/v1/autoedit/project/${projectId}/consolidate`, {
+    method: 'POST',
+    headers: {
+      'X-API-Key': API_KEY,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      force_regenerate: options.forceRegenerate || false,
+      redundancy_threshold: options.threshold || 0.85,
+      auto_apply: options.autoApply || false
+    })
+  });
+
+  return await response.json();
+};
+
+// Uso
+const result = await startConsolidation('proj_abc123', {
+  threshold: 0.85,  // 85% similitud = redundancia
+  autoApply: false  // Requiere revisión humana
+});
+```
+
+#### Monitorear Estado de Consolidación
+
+```javascript
+const getConsolidationStatus = async (projectId) => {
+  const response = await fetch(
+    `${API_BASE_URL}/v1/autoedit/project/${projectId}/consolidation-status`,
+    { headers: { 'X-API-Key': API_KEY } }
+  );
+  return await response.json();
+};
+
+// Hook de React para polling
+function useConsolidationProgress(projectId, pollInterval = 5000) {
+  const [status, setStatus] = useState(null);
+  const [isComplete, setIsComplete] = useState(false);
+
+  useEffect(() => {
+    const poll = async () => {
+      const data = await getConsolidationStatus(projectId);
+      setStatus(data);
+
+      const completeStates = [
+        'consolidated',
+        'consolidation_complete',
+        'consolidation_failed'
+      ];
+      if (completeStates.includes(data.consolidation_state)) {
+        setIsComplete(true);
+      }
+    };
+
+    poll();
+    const interval = setInterval(poll, pollInterval);
+    return () => clearInterval(interval);
+  }, [projectId, pollInterval]);
+
+  return { status, isComplete };
+}
+```
+
+#### Obtener Redundancias Detectadas
+
+```javascript
+const getRedundancies = async (projectId) => {
+  const response = await fetch(
+    `${API_BASE_URL}/v1/autoedit/project/${projectId}/redundancies`,
+    { headers: { 'X-API-Key': API_KEY } }
+  );
+  return await response.json();
+};
+
+// Response example:
+// {
+//   "project_id": "proj_abc123",
+//   "redundancy_count": 5,
+//   "redundancy_score": 42.5,
+//   "interpretation": "Moderate redundancy - some repeated content detected",
+//   "redundancies": [
+//     {
+//       "id": "red_abc_def_0",
+//       "video_a": {
+//         "workflow_id": "wf_abc",
+//         "sequence_index": 0,
+//         "segment": { "start_sec": 30, "end_sec": 45, "index": 3 }
+//       },
+//       "video_b": {
+//         "workflow_id": "wf_def",
+//         "sequence_index": 1,
+//         "segment": { "start_sec": 60, "end_sec": 75, "index": 5 }
+//       },
+//       "similarity": 0.92,
+//       "severity": "high"
+//     }
+//   ]
+// }
+```
+
+#### Obtener Análisis Narrativo
+
+```javascript
+const getNarrativeAnalysis = async (projectId) => {
+  const response = await fetch(
+    `${API_BASE_URL}/v1/autoedit/project/${projectId}/narrative`,
+    { headers: { 'X-API-Key': API_KEY } }
+  );
+  return await response.json();
+};
+
+// Response example:
+// {
+//   "arc_type": "complete",  // complete, open_ended, in_medias_res, episodic
+//   "narrative_functions": {
+//     "introduction": 1,
+//     "rising_action": 2,
+//     "climax": 1,
+//     "resolution": 1
+//   },
+//   "tone_consistency": 0.85,
+//   "unique_tones": ["informativo", "entusiasta"],
+//   "video_sequence": [
+//     {
+//       "index": 0,
+//       "function": "introduction",
+//       "tone": "informativo",
+//       "summary": "Introducción al tema principal..."
+//     }
+//   ]
+// }
+```
+
+#### Obtener Recomendaciones
+
+```javascript
+const getRecommendations = async (projectId) => {
+  const response = await fetch(
+    `${API_BASE_URL}/v1/autoedit/project/${projectId}/recommendations`,
+    { headers: { 'X-API-Key': API_KEY } }
+  );
+  return await response.json();
+};
+
+// Response example:
+// {
+//   "recommendations": [
+//     {
+//       "id": "rec_red_abc_def_0",
+//       "type": "remove_redundant_segment",
+//       "priority": "high",
+//       "action": {
+//         "workflow_id": "wf_def",
+//         "segment": { "start_sec": 60, "end_sec": 75 }
+//       },
+//       "reason": "Similar content (92%) already in video 1",
+//       "estimated_savings_sec": 15,
+//       "keep_reference": {
+//         "workflow_id": "wf_abc",
+//         "segment": { "start_sec": 30, "end_sec": 45 }
+//       }
+//     }
+//   ],
+//   "total_savings_sec": 45
+// }
+```
+
+#### Updated Blocks: Bloques Pre-Modificados (v1.5.0+)
+
+A partir de v1.5.0, la respuesta de consolidación incluye `updated_blocks` - los bloques de cada video **ya modificados** con las redundancias marcadas para eliminación. Esto permite mostrar una vista unificada de todos los videos con los cambios propuestos.
+
+```javascript
+// Al iniciar consolidación, la respuesta incluye updated_blocks
+const consolidationResult = await startConsolidation('proj_abc123');
+
+// Response structure:
+// {
+//   "status": "success",
+//   "redundancies_found": 10,
+//   "total_savings_sec": 120,
+//
+//   "updated_blocks": {
+//     "wf_abc123": {
+//       "blocks": [...],  // Array de bloques con cambios aplicados
+//       "changes_applied": [
+//         {
+//           "block_index": 5,
+//           "change_type": "marked_for_removal",
+//           "reason": "Redundant with video 2, block 12 (99% similarity)",
+//           "original_action": "keep",
+//           "new_action": "remove",
+//           "similarity": 0.99
+//         }
+//       ],
+//       "original_keep_count": 15,
+//       "new_keep_count": 12,
+//       "savings_sec": 45
+//     },
+//     "wf_def456": {
+//       "blocks": [...],
+//       "changes_applied": [...],
+//       ...
+//     }
+//   },
+//
+//   "narrative_analysis": {...},
+//   "recommendations": [...]
+// }
+```
+
+**Ventajas de `updated_blocks`:**
+- No necesitas procesar cada recomendación individualmente
+- Los bloques ya tienen `action: "remove"` y `removal_reason` aplicados
+- Puedes mostrar todos los videos en una sola pantalla con cambios visuales
+- El usuario puede aceptar todo con un click, o revisar cambio por cambio
+
+**Ejemplo de uso en React:**
+
+```jsx
+function UnifiedVideoReview({ projectId, updatedBlocks }) {
+  const [acceptedChanges, setAcceptedChanges] = useState(new Set());
+
+  // Agrupar cambios por video
+  const videoChanges = Object.entries(updatedBlocks).map(([workflowId, data]) => ({
+    workflowId,
+    blocks: data.blocks,
+    changes: data.changes_applied,
+    savings: data.savings_sec,
+    originalKeep: data.original_keep_count,
+    newKeep: data.new_keep_count
+  }));
+
+  return (
+    <div className="unified-review">
+      <div className="review-summary">
+        <h2>Revisión de Consolidación</h2>
+        <p>
+          {videoChanges.reduce((sum, v) => sum + v.changes.length, 0)} cambios propuestos
+          {' | '}
+          Ahorro total: {videoChanges.reduce((sum, v) => sum + v.savings, 0)}s
+        </p>
+      </div>
+
+      {videoChanges.map(video => (
+        <div key={video.workflowId} className="video-changes">
+          <div className="video-header">
+            <h3>Video: {video.workflowId}</h3>
+            <span className="change-count">
+              {video.originalKeep} → {video.newKeep} bloques
+              ({video.savings}s menos)
+            </span>
+          </div>
+
+          <div className="changes-list">
+            {video.changes.map((change, idx) => (
+              <div
+                key={`${video.workflowId}-${change.block_index}`}
+                className={`change-item ${acceptedChanges.has(`${video.workflowId}-${change.block_index}`) ? 'accepted' : ''}`}
+              >
+                <input
+                  type="checkbox"
+                  checked={acceptedChanges.has(`${video.workflowId}-${change.block_index}`)}
+                  onChange={(e) => {
+                    const key = `${video.workflowId}-${change.block_index}`;
+                    const newSet = new Set(acceptedChanges);
+                    e.target.checked ? newSet.add(key) : newSet.delete(key);
+                    setAcceptedChanges(newSet);
+                  }}
+                />
+                <div className="change-info">
+                  <span className="block-index">Bloque #{change.block_index}</span>
+                  <span className="similarity">{Math.round(change.similarity * 100)}% similar</span>
+                  <p className="reason">{change.reason}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+
+      <div className="review-actions">
+        <button onClick={() => {
+          // Seleccionar todos los cambios
+          const allChanges = videoChanges.flatMap(v =>
+            v.changes.map(c => `${v.workflowId}-${c.block_index}`)
+          );
+          setAcceptedChanges(new Set(allChanges));
+        }}>
+          Aceptar Todos
+        </button>
+        <button onClick={() => setAcceptedChanges(new Set())}>
+          Rechazar Todos
+        </button>
+        <button
+          className="btn-primary"
+          onClick={() => applyAcceptedChanges(acceptedChanges)}
+        >
+          Aplicar {acceptedChanges.size} cambios
+        </button>
+      </div>
+    </div>
+  );
+}
+```
+
+**CSS para la vista unificada:**
+
+```css
+.unified-review {
+  padding: 24px;
+}
+
+.video-changes {
+  margin-bottom: 24px;
+  border: 1px solid #333;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.video-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px;
+  background: #1a1a2e;
+}
+
+.change-count {
+  color: #4CAF50;
+  font-weight: bold;
+}
+
+.change-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #333;
+  transition: background 0.2s;
+}
+
+.change-item:hover {
+  background: rgba(255,255,255,0.05);
+}
+
+.change-item.accepted {
+  background: rgba(76, 175, 80, 0.1);
+}
+
+.similarity {
+  background: #f44336;
+  color: white;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.reason {
+  color: #888;
+  font-size: 14px;
+  margin-top: 4px;
+}
+```
+
+#### Aplicar Recomendaciones
+
+```javascript
+const applyRecommendations = async (projectId, recommendationIds = null) => {
+  const response = await fetch(
+    `${API_BASE_URL}/v1/autoedit/project/${projectId}/apply-recommendations`,
+    {
+      method: 'POST',
+      headers: {
+        'X-API-Key': API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        // Si es null, aplica todas. Si es array, solo las especificadas
+        recommendation_ids: recommendationIds
+      })
+    }
+  );
+  return await response.json();
+};
+
+// Aplicar todas
+await applyRecommendations('proj_abc123');
+
+// Aplicar solo algunas
+await applyRecommendations('proj_abc123', ['rec_1', 'rec_3']);
+```
+
+#### Reordenar Videos
+
+```javascript
+const reorderVideos = async (projectId, newOrder) => {
+  const response = await fetch(
+    `${API_BASE_URL}/v1/autoedit/project/${projectId}/videos/reorder`,
+    {
+      method: 'PUT',
+      headers: {
+        'X-API-Key': API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        workflow_ids: newOrder  // Array de workflow_ids en nuevo orden
+      })
+    }
+  );
+  return await response.json();
+};
+
+// Nota: Reordenar invalida la consolidación existente
+```
+
+### UI Recomendada para Consolidación
+
+#### Panel de Estado de Consolidación
+
+```jsx
+function ConsolidationStatusPanel({ projectId }) {
+  const { status, isComplete } = useConsolidationProgress(projectId);
+
+  if (!status) return <LoadingSpinner />;
+
+  const stateLabels = {
+    not_started: 'No iniciada',
+    generating_embeddings: 'Generando embeddings...',
+    generating_summaries: 'Generando resúmenes...',
+    detecting_redundancies: 'Detectando redundancias...',
+    analyzing_narrative: 'Analizando narrativa...',
+    consolidating: 'Consolidando...',
+    consolidated: 'Consolidación completa',
+    consolidation_complete: 'Aplicado exitosamente',
+    consolidation_failed: 'Error en consolidación'
+  };
+
+  const stateIcons = {
+    not_started: '⏸️',
+    generating_embeddings: '🔄',
+    generating_summaries: '📝',
+    detecting_redundancies: '🔍',
+    analyzing_narrative: '📊',
+    consolidating: '⚙️',
+    consolidated: '✅',
+    consolidation_complete: '🎉',
+    consolidation_failed: '❌'
+  };
+
+  return (
+    <div className="consolidation-status">
+      <div className="status-header">
+        <span className="status-icon">
+          {stateIcons[status.consolidation_state]}
+        </span>
+        <span className="status-label">
+          {stateLabels[status.consolidation_state]}
+        </span>
+      </div>
+
+      {status.has_redundancy_analysis && (
+        <div className="status-stats">
+          <span>Redundancias encontradas: {status.redundancy_count}</span>
+          <span>Temas cubiertos: {status.topics_covered}</span>
+        </div>
+      )}
+
+      {!isComplete && (
+        <div className="progress-indicator">
+          <div className="spinner" />
+          <span>Procesando...</span>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+#### Panel de Redundancias
+
+```jsx
+function RedundancyPanel({ projectId }) {
+  const [redundancies, setRedundancies] = useState(null);
+
+  useEffect(() => {
+    getRedundancies(projectId).then(setRedundancies);
+  }, [projectId]);
+
+  if (!redundancies) return <LoadingSpinner />;
+
+  return (
+    <div className="redundancy-panel">
+      <div className="redundancy-score">
+        <h3>Score de Redundancia</h3>
+        <div className="score-meter">
+          <div
+            className="score-fill"
+            style={{ width: `${redundancies.redundancy_score}%` }}
+          />
+          <span>{redundancies.redundancy_score.toFixed(1)}/100</span>
+        </div>
+        <p className="interpretation">{redundancies.interpretation}</p>
+      </div>
+
+      <div className="redundancy-list">
+        <h3>Redundancias Detectadas ({redundancies.redundancy_count})</h3>
+
+        {redundancies.redundancies.map(red => (
+          <div
+            key={red.id}
+            className={`redundancy-card severity-${red.severity}`}
+          >
+            <div className="redundancy-header">
+              <span className="similarity">
+                {Math.round(red.similarity * 100)}% similar
+              </span>
+              <span className={`severity-badge ${red.severity}`}>
+                {red.severity}
+              </span>
+            </div>
+
+            <div className="video-comparison">
+              <div className="video-ref video-a">
+                <span className="video-label">Video {red.video_a.sequence_index + 1}</span>
+                <span className="timestamp">
+                  {formatTime(red.video_a.segment.start_sec * 1000)} -
+                  {formatTime(red.video_a.segment.end_sec * 1000)}
+                </span>
+              </div>
+
+              <span className="comparison-arrow">↔️</span>
+
+              <div className="video-ref video-b">
+                <span className="video-label">Video {red.video_b.sequence_index + 1}</span>
+                <span className="timestamp">
+                  {formatTime(red.video_b.segment.start_sec * 1000)} -
+                  {formatTime(red.video_b.segment.end_sec * 1000)}
+                </span>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+#### Panel de Recomendaciones (HITL 3)
+
+```jsx
+function RecommendationsPanel({ projectId, onApply }) {
+  const [recommendations, setRecommendations] = useState(null);
+  const [selected, setSelected] = useState(new Set());
+
+  useEffect(() => {
+    getRecommendations(projectId).then(data => {
+      setRecommendations(data.recommendations);
+      // Seleccionar todas por defecto
+      setSelected(new Set(data.recommendations.map(r => r.id)));
+    });
+  }, [projectId]);
+
+  const toggleSelection = (id) => {
+    const newSelected = new Set(selected);
+    if (newSelected.has(id)) {
+      newSelected.delete(id);
+    } else {
+      newSelected.add(id);
+    }
+    setSelected(newSelected);
+  };
+
+  const handleApply = async () => {
+    const selectedIds = Array.from(selected);
+    await applyRecommendations(projectId, selectedIds);
+    onApply();
+  };
+
+  if (!recommendations) return <LoadingSpinner />;
+
+  const totalSavings = recommendations
+    .filter(r => selected.has(r.id))
+    .reduce((sum, r) => sum + r.estimated_savings_sec, 0);
+
+  return (
+    <div className="recommendations-panel">
+      <div className="panel-header">
+        <h3>Recomendaciones de Corte</h3>
+        <div className="savings-summary">
+          Ahorro estimado: {formatDuration(totalSavings * 1000)}
+        </div>
+      </div>
+
+      <div className="recommendations-list">
+        {recommendations.map(rec => (
+          <div
+            key={rec.id}
+            className={`recommendation-card ${selected.has(rec.id) ? 'selected' : ''}`}
+            onClick={() => toggleSelection(rec.id)}
+          >
+            <input
+              type="checkbox"
+              checked={selected.has(rec.id)}
+              onChange={() => toggleSelection(rec.id)}
+            />
+
+            <div className="rec-content">
+              <div className="rec-reason">{rec.reason}</div>
+              <div className="rec-action">
+                Eliminar {rec.estimated_savings_sec}s del Video{' '}
+                {/* Aquí podrías agregar el nombre del video */}
+              </div>
+              <span className={`priority-badge ${rec.priority}`}>
+                {rec.priority}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="panel-actions">
+        <button
+          className="btn-secondary"
+          onClick={() => setSelected(new Set())}
+        >
+          Deseleccionar todo
+        </button>
+        <button
+          className="btn-secondary"
+          onClick={() => setSelected(new Set(recommendations.map(r => r.id)))}
+        >
+          Seleccionar todo
+        </button>
+        <button
+          className="btn-primary"
+          onClick={handleApply}
+          disabled={selected.size === 0}
+        >
+          Aplicar {selected.size} recomendaciones
+        </button>
+      </div>
+    </div>
+  );
+}
+```
+
+### Estilos CSS para Consolidación
+
+```css
+/* Score Meter */
+.score-meter {
+  position: relative;
+  height: 24px;
+  background: #2d2d2d;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.score-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #4CAF50, #FFC107, #f44336);
+  transition: width 0.5s ease;
+}
+
+.score-meter span {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-weight: bold;
+  color: white;
+}
+
+/* Severity badges */
+.severity-badge.high {
+  background: #f44336;
+  color: white;
+}
+
+.severity-badge.medium {
+  background: #FFC107;
+  color: black;
+}
+
+.severity-badge.low {
+  background: #4CAF50;
+  color: white;
+}
+
+/* Recommendation cards */
+.recommendation-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px;
+  background: #1a1a2e;
+  border: 1px solid #333;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.recommendation-card:hover {
+  background: #252542;
+  border-color: #666;
+}
+
+.recommendation-card.selected {
+  background: rgba(76, 175, 80, 0.1);
+  border-color: #4CAF50;
+}
+
+/* Priority badges */
+.priority-badge {
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: bold;
+}
+
+.priority-badge.high { background: #f44336; color: white; }
+.priority-badge.medium { background: #FFC107; color: black; }
+.priority-badge.low { background: #4CAF50; color: white; }
+```
+
+### Flujo Completo con Consolidación
+
+```javascript
+// Hook completo para proyectos con consolidación
+function useProjectWithConsolidation(projectId) {
+  const [project, setProject] = useState(null);
+  const [consolidation, setConsolidation] = useState(null);
+  const [redundancies, setRedundancies] = useState(null);
+  const [narrative, setNarrative] = useState(null);
+  const [recommendations, setRecommendations] = useState(null);
+
+  // Cargar datos iniciales
+  useEffect(() => {
+    const load = async () => {
+      // Proyecto y stats
+      const projectData = await getProjectStats(projectId);
+      setProject(projectData);
+
+      // Estado de consolidación
+      const consolStatus = await getConsolidationStatus(projectId);
+      setConsolidation(consolStatus);
+
+      // Si está consolidado, cargar resultados
+      if (['consolidated', 'consolidation_complete'].includes(consolStatus.consolidation_state)) {
+        const [red, narr, recs] = await Promise.all([
+          getRedundancies(projectId),
+          getNarrativeAnalysis(projectId),
+          getRecommendations(projectId)
+        ]);
+        setRedundancies(red);
+        setNarrative(narr);
+        setRecommendations(recs);
+      }
+    };
+
+    load();
+  }, [projectId]);
+
+  // Iniciar consolidación
+  const startConsolidation = async (options = {}) => {
+    const result = await consolidateProject(projectId, options);
+    setConsolidation({ consolidation_state: 'consolidating' });
+    return result;
+  };
+
+  // Aplicar recomendaciones
+  const applyRecs = async (ids = null) => {
+    const result = await applyRecommendations(projectId, ids);
+    // Recargar estado
+    const consolStatus = await getConsolidationStatus(projectId);
+    setConsolidation(consolStatus);
+    return result;
+  };
+
+  return {
+    project,
+    consolidation,
+    redundancies,
+    narrative,
+    recommendations,
+    startConsolidation,
+    applyRecommendations: applyRecs
+  };
+}
+```
+
+---
+
 ## Recursos Adicionales
 
 - [API Reference](./API-REFERENCE.md) - Documentación completa de endpoints
 - [Workflow States](./WORKFLOW-STATES.md) - Diagrama de estados
 - [MCP Integration](./MCP-INTEGRATION.md) - Integración con agentes AI
 - [CHANGELOG](./CHANGELOG.md) - Historial de cambios
+- [ROADMAP](./ROADMAP.md) - Próximas funcionalidades

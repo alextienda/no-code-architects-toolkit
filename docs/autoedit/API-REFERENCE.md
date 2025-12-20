@@ -2,7 +2,7 @@
 
 Documentación completa de la API REST para el pipeline de edición automática de video con AI.
 
-**Versión**: 1.4.0
+**Versión**: 1.5.0
 
 ---
 
@@ -1357,6 +1357,15 @@ Crear un nuevo proyecto multi-video.
     "language": "es",
     "style": "dynamic",
     "auto_broll": true
+  },
+  "project_context": {
+    "campaign": "Partnership con flight school XYZ",
+    "sponsor": "Marca ABC",
+    "specific_audience": "Estudiantes preparando examen PPL",
+    "tone_override": "más técnico",
+    "focus": "precisión en terminología aeronáutica",
+    "call_to_action": "inscripción al curso completo",
+    "creator_name": "Alex"
   }
 }
 ```
@@ -1368,6 +1377,46 @@ Crear un nuevo proyecto multi-video.
 | `options.language` | string | No | "es" | Idioma para transcripción |
 | `options.style` | string | No | "dynamic" | Estilo de análisis |
 | `options.auto_broll` | boolean | No | false | Ejecutar análisis B-Roll |
+| `project_context` | object | No | {} | **Nuevo v1.5.0:** Contexto específico del proyecto |
+
+**Campos de project_context (todos opcionales):**
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `campaign` | string | Nombre de campaña o partnership |
+| `sponsor` | string | Nombre del sponsor |
+| `specific_audience` | string | Audiencia específica para este proyecto |
+| `tone_override` | string (enum) | Override del tono global. Valores: "más técnico", "más casual", "más formal", "más energético" |
+| `style_override` | string | Override del estilo de edición |
+| `focus` | string | Enfoque específico para este proyecto |
+| `call_to_action` | string | Call to action a preservar |
+| `keywords_to_keep` | array[string] | Palabras clave que NO deben eliminarse |
+| `keywords_to_avoid` | array[string] | Palabras clave que DEBEN eliminarse |
+| `creator_name` | string | Override del nombre del creador para este proyecto |
+
+**Uso de project_context:**
+
+El `project_context` permite personalizar cómo el AI analiza y limpia el contenido para este proyecto específico:
+
+```javascript
+// Ejemplo: Proyecto de curso técnico con sponsor
+const response = await fetch('/v1/autoedit/project', {
+  method: 'POST',
+  headers: { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    name: "Curso METAR Avanzado",
+    project_context: {
+      campaign: "Curso PPL 2025",
+      sponsor: "Jeppesen",
+      specific_audience: "Estudiantes de piloto privado",
+      tone_override: "más técnico",
+      focus: "terminología meteorológica precisa",
+      keywords_to_keep: ["METAR", "TAF", "SIGMET", "NOTAM"],
+      creator_name: "Capitán Alex"
+    }
+  })
+});
+```
 
 **Response (201 Created):**
 
@@ -1789,7 +1838,28 @@ Ejecutar el pipeline de consolidación completo.
         "tone_consistency": 0.8
       }
     },
-    "recommendations": [...]
+    "recommendations": [...],
+    "updated_blocks": {
+      "wf_abc123": {
+        "blocks": [...],
+        "changes_applied": [
+          {
+            "block_index": 5,
+            "change_type": "marked_for_removal",
+            "reason": "Redundant with video 2, block 12 (95% similarity)",
+            "original_action": "keep",
+            "new_action": "remove",
+            "similarity": 0.95
+          }
+        ],
+        "original_keep_count": 15,
+        "new_keep_count": 12,
+        "blocks_removed": 3,
+        "savings_sec": 45.3
+      },
+      "wf_def456": {...}
+    },
+    "total_savings_sec": 120.5
   }
 }
 ```
@@ -2202,6 +2272,23 @@ Causas comunes:
 ---
 
 ## Changelog
+
+### v1.5.0 (2025-12) - Aspect Ratio + Creator Profile + Enhanced Consolidation
+- **Aspect Ratio Preservation**: Videos now preserve their original aspect ratio
+  - 9:16 vertical videos remain vertical (no longer forced to 16:9)
+  - New functions: `get_video_dimensions_from_url()`, `get_dynamic_scale()`
+  - Render profiles now use `target_short_side` instead of hardcoded scales
+- **Creator Global Profile**: Global profile for personalized AI prompts
+  - `CREATOR_GLOBAL_PROFILE` in config.py with defaults
+  - `get_effective_creator_profile()` for merging global + project overrides
+  - AI prompts now use creator name instead of "el orador"
+- **Project Context Override**: New `project_context` field in project creation
+  - Fields: campaign, sponsor, specific_audience, tone_override, style_override, focus, call_to_action, keywords_to_keep, keywords_to_avoid, creator_name
+  - Context propagated to analysis functions
+- **Enhanced Consolidation Response**: `updated_blocks` field with pre-modified blocks
+  - Blocks with redundancies already marked for removal
+  - Per-workflow: blocks, changes_applied, original_keep_count, new_keep_count, savings_sec
+  - Global: `total_savings_sec`
 
 ### v1.4.0 (2025-12) - Fase 4B
 - **Multi-Video Context**: Sistema de contexto progresivo entre videos

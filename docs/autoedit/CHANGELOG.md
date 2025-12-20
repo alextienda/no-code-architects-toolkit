@@ -5,6 +5,70 @@ All notable changes to the AutoEdit pipeline will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2025-12-20 - Aspect Ratio Preservation + Creator Profile + Enhanced Consolidation
+
+### Added
+
+#### Aspect Ratio Preservation (Fix Video Orientation Bug)
+- **Dynamic Scaling**: Videos now preserve their original aspect ratio in preview and render
+  - 9:16 vertical videos remain vertical (no longer forced to 16:9)
+  - 16:9 horizontal videos remain horizontal
+  - Any custom aspect ratios are preserved
+- **New Functions in ffmpeg_builder.py**:
+  - `get_video_dimensions_from_url()`: Detects video width/height using ffprobe
+  - `get_dynamic_scale()`: Calculates scale preserving aspect ratio
+  - Ensures even dimensions for H.264 codec compatibility
+- **Updated Render Profiles**: Now use `target_short_side` instead of hardcoded scales
+  - `preview`: 480 pixels on short side
+  - `preview_720p`: 720 pixels on short side
+- **Modified Functions**: All preview/render functions now accept `video_width` and `video_height` parameters
+  - `build_preview_payload()`
+  - `build_final_render_payload()`
+  - `build_ffmpeg_compose_payload()`
+  - `generate_preview()`
+  - `generate_final_render()`
+
+#### Creator Global Profile
+- **CREATOR_GLOBAL_PROFILE in config.py**: Global profile with creator defaults
+  - `name`: Creator name (default: "Alex", configurable via CREATOR_NAME env var)
+  - `brand`: Content brand description
+  - `audience`: Target audience
+  - `style`: Content style
+  - `tone`: Content tone
+  - `typical_content`: List of typical content types
+  - `avoid`: List of things to avoid
+- **Profile Injection in Prompts**: AI prompts now use creator name instead of "el orador"
+- **get_effective_creator_profile()**: Merges global profile with project-specific overrides
+
+#### Project Context Override
+- **New project_context Field**: Optional field when creating projects
+  - `campaign`: Campaign or partnership name
+  - `sponsor`: Sponsor name
+  - `specific_audience`: Project-specific audience
+  - `tone_override`: Override tone (enum: más técnico, más casual, más formal, más energético)
+  - `style_override`: Override style
+  - `focus`: Specific focus for this project
+  - `call_to_action`: Call to action text
+  - `keywords_to_keep`: Keywords that should not be removed
+  - `keywords_to_avoid`: Keywords that should be removed
+  - `creator_name`: Override creator name for this project
+- **Context Propagation**: Project context is passed to analysis functions
+
+#### Updated Blocks in Consolidation Response
+- **updated_blocks Field**: POST /project/{id}/consolidate now returns pre-modified blocks
+  - For each workflow: `blocks`, `changes_applied`, `original_keep_count`, `new_keep_count`, `blocks_removed`, `savings_sec`
+  - Changes are already applied (action changed to "remove" with reasons)
+  - Frontend can display unified view of all videos with proposed changes
+- **total_savings_sec**: Total time savings across all workflows
+
+### Technical Details
+- FFprobe used for dimension detection (30 second timeout)
+- Even dimensions enforced (width % 2 == 0, height % 2 == 0)
+- Deep copy used for block manipulation to avoid reference issues
+- 39 new structural tests in `tests/test_new_features_v150.py`
+
+---
+
 ## [1.4.1] - 2025-12-19 - Workflow Filtering for Project Start
 
 ### Added

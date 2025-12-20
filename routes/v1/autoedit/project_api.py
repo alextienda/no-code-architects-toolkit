@@ -93,6 +93,56 @@ CREATE_PROJECT_SCHEMA = {
                 }
             },
             "additionalProperties": True
+        },
+        "project_context": {
+            "type": "object",
+            "description": "Creator profile overrides for this specific project",
+            "properties": {
+                "campaign": {
+                    "type": "string",
+                    "description": "Campaign or project theme (e.g., 'Partnership with XYZ')"
+                },
+                "sponsor": {
+                    "type": "string",
+                    "description": "Sponsor or brand for this project"
+                },
+                "specific_audience": {
+                    "type": "string",
+                    "description": "Target audience for this project (overrides global)"
+                },
+                "tone_override": {
+                    "type": "string",
+                    "enum": ["más técnico", "más casual", "más formal", "más energético"],
+                    "description": "Override the global tone setting"
+                },
+                "style_override": {
+                    "type": "string",
+                    "description": "Override the global style setting"
+                },
+                "focus": {
+                    "type": "string",
+                    "description": "Special focus for this project (e.g., 'precisión técnica')"
+                },
+                "call_to_action": {
+                    "type": "string",
+                    "description": "Desired call-to-action (e.g., 'inscripción al curso')"
+                },
+                "keywords_to_keep": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Keywords that should always be kept"
+                },
+                "keywords_to_avoid": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Keywords that should be avoided/removed"
+                },
+                "creator_name": {
+                    "type": "string",
+                    "description": "Override the creator name for this project"
+                }
+            },
+            "additionalProperties": True
         }
     },
     "required": ["name"],
@@ -207,8 +257,9 @@ def create_project_endpoint(job_id, data):
         name = data["name"]
         description = data.get("description")
         options = data.get("options", {})
+        project_context = data.get("project_context")
 
-        project_id = create_project(name, description, options)
+        project_id = create_project(name, description, options, project_context)
         project_data = get_project(project_id)
 
         logger.info(f"Created project {project_id}: {name}")

@@ -26,6 +26,7 @@ The consolidation can be automatic or require human review (HITL 3).
 
 import os
 import json
+import copy
 import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
@@ -124,7 +125,20 @@ class ProjectConsolidator:
             # Step 6: Generate final recommendations
             results["recommendations"] = self._compile_recommendations(results)
 
-            # Step 7: Apply if auto mode
+            # Step 7: Generate updated_blocks for each workflow
+            # This provides pre-applied JSONs showing what would change
+            results["updated_blocks"] = self._generate_updated_blocks(
+                results["recommendations"]
+            )
+
+            # Calculate total savings across all workflows
+            total_savings_sec = sum(
+                ub.get("savings_sec", 0)
+                for ub in results["updated_blocks"].values()
+            )
+            results["total_savings_sec"] = round(total_savings_sec, 2)
+
+            # Step 8: Apply if auto mode
             if auto_apply and results["recommendations"]:
                 results["steps"]["applied"] = self._apply_recommendations(
                     results["recommendations"]
@@ -398,6 +412,130 @@ class ProjectConsolidator:
         recommendations.sort(key=lambda x: priority_order.get(x.get("priority", "low"), 3))
 
         return recommendations
+
+    def _generate_updated_blocks(
+        self,
+        recommendations: List[Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Generate updated blocks for each workflow with redundancy eliminations applied.
+
+        This provides the frontend with pre-modified JSONs showing exactly what would
+        change if the recommendations are accepted. The blocks have action="remove"
+        set for redundant segments.
+
+        Args:
+            recommendations: List of removal recommendations
+
+        Returns:
+            Dict mapping workflow_id to updated block data:
+            {
+                "workflow_id": {
+                    "blocks": [...],  # Updated blocks with removals marked
+                    "changes_applied": [...],  # List of changes made
+                    "original_keep_count": int,
+                    "new_keep_count": int,
+                    "savings_sec": float
+                }
+            }
+        """
+        logger.info("Generating updated_blocks for all workflows")
+
+        # Group recommendations by workflow
+        by_workflow = {}
+        for rec in recommendations:
+            if rec.get("type") == "remove_redundant_segment":
+                wf_id = rec["action"]["workflow_id"]
+                if wf_id not in by_workflow:
+                    by_workflow[wf_id] = []
+                by_workflow[wf_id].append(rec)
+
+        updated_blocks = {}
+
+        for wf_id in self.workflow_ids:
+            workflow = self.wf_manager.get(wf_id)
+            if not workflow:
+                continue
+
+            # Get original blocks
+            original_blocks = workflow.get("blocks", [])
+            if not original_blocks:
+                continue
+
+            # Deep copy blocks for modification
+            new_blocks = copy.deepcopy(original_blocks)
+            changes_applied = []
+
+            # Get recommendations for this workflow
+            wf_recommendations = by_workflow.get(wf_id, [])
+
+            for rec in wf_recommendations:
+                segment = rec["action"]["segment"]
+                segment_start = segment.get("start_sec", 0)
+                segment_end = segment.get("end_sec", 0)
+
+                # Find matching block(s) by time overlap
+                for idx, block in enumerate(new_blocks):
+                    block_start_sec = block.get("inMs", 0) / 1000.0
+                    block_end_sec = block.get("outMs", 0) / 1000.0
+
+                    # Check if block overlaps with redundant segment
+                    # Use a 0.5 second tolerance for matching
+                    if (abs(block_start_sec - segment_start) < 0.5 or
+                        (segment_start <= block_start_sec <= segment_end) or
+                        (segment_start <= block_end_sec <= segment_end)):
+
+                        original_action = block.get("action", "keep")
+
+                        # Only mark for removal if not already removed
+                        if original_action != "remove":
+                            new_blocks[idx]["action"] = "remove"
+                            new_blocks[idx]["removal_reason"] = rec.get("reason", "redundant")
+                            new_blocks[idx]["redundancy_id"] = rec.get("id")
+                            new_blocks[idx]["similarity"] = rec.get("similarity", 0)
+                            new_blocks[idx]["keep_reference"] = rec.get("keep_reference")
+
+                            block_duration_sec = (block_end_sec - block_start_sec)
+
+                            changes_applied.append({
+                                "block_index": idx,
+                                "block_id": block.get("id"),
+                                "change_type": "marked_for_removal",
+                                "reason": rec.get("reason", "redundant"),
+                                "original_action": original_action,
+                                "new_action": "remove",
+                                "similarity": rec.get("similarity", 0),
+                                "savings_sec": round(block_duration_sec, 2),
+                                "keep_reference": rec.get("keep_reference")
+                            })
+                            break  # Only mark one block per recommendation
+
+            # Calculate stats
+            original_keep_count = sum(
+                1 for b in original_blocks
+                if b.get("action", "keep") != "remove"
+            )
+            new_keep_count = sum(
+                1 for b in new_blocks
+                if b.get("action", "keep") != "remove"
+            )
+            savings_sec = sum(
+                (b.get("outMs", 0) - b.get("inMs", 0)) / 1000.0
+                for b in new_blocks
+                if b.get("removal_reason")  # Only newly marked blocks
+            )
+
+            updated_blocks[wf_id] = {
+                "blocks": new_blocks,
+                "changes_applied": changes_applied,
+                "original_keep_count": original_keep_count,
+                "new_keep_count": new_keep_count,
+                "blocks_removed": len(changes_applied),
+                "savings_sec": round(savings_sec, 2)
+            }
+
+        logger.info(f"Generated updated_blocks for {len(updated_blocks)} workflows")
+        return updated_blocks
 
     def _apply_recommendations(
         self,

@@ -23,9 +23,92 @@ CROSSFADE TECHNIQUE:
 """
 
 import logging
-from typing import List, Dict, Any, Optional
+import subprocess
+import json
+from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# VIDEO DIMENSION UTILITIES
+# =============================================================================
+
+def get_video_dimensions_from_url(video_url: str) -> Tuple[int, int]:
+    """Get video dimensions from a remote URL using ffprobe.
+
+    Args:
+        video_url: URL of the video file
+
+    Returns:
+        Tuple of (width, height). Returns (0, 0) on error.
+    """
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json",
+            video_url
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            stream = data.get("streams", [{}])[0]
+            width = int(stream.get("width", 0))
+            height = int(stream.get("height", 0))
+            logger.info(f"Video dimensions: {width}x{height}")
+            return width, height
+
+        logger.warning(f"ffprobe failed: {result.stderr}")
+        return 0, 0
+
+    except Exception as e:
+        logger.error(f"Error getting video dimensions: {e}")
+        return 0, 0
+
+
+def get_dynamic_scale(width: int, height: int, target_short_side: int = 480) -> str:
+    """Calculate scale string preserving aspect ratio.
+
+    For vertical videos (9:16), the width becomes the short side.
+    For horizontal videos (16:9), the height becomes the short side.
+
+    Args:
+        width: Original video width
+        height: Original video height
+        target_short_side: Target size for the shorter dimension
+
+    Returns:
+        FFmpeg scale string like "270:480" (vertical) or "854:480" (horizontal)
+    """
+    if width == 0 or height == 0:
+        # Fallback to 16:9 horizontal if dimensions unknown
+        logger.warning("Unknown video dimensions, defaulting to 854:480")
+        return "854:480"
+
+    is_vertical = height > width
+
+    if is_vertical:
+        # Vertical video (9:16): height is the long side
+        # Scale width to target, calculate height proportionally
+        new_width = target_short_side
+        new_height = int(height * target_short_side / width)
+    else:
+        # Horizontal video (16:9): width is the long side
+        # Scale height to target, calculate width proportionally
+        new_height = target_short_side
+        new_width = int(width * target_short_side / height)
+
+    # Ensure dimensions are even (required for H.264)
+    new_width = new_width if new_width % 2 == 0 else new_width + 1
+    new_height = new_height if new_height % 2 == 0 else new_height + 1
+
+    scale_str = f"{new_width}:{new_height}"
+    logger.info(f"Dynamic scale: {width}x{height} -> {scale_str} (vertical={is_vertical})")
+    return scale_str
 
 # =============================================================================
 # RENDER PROFILES
@@ -33,7 +116,8 @@ logger = logging.getLogger(__name__)
 
 RENDER_PROFILES = {
     "preview": {
-        "scale": "854:480",       # 480p
+        "scale": None,            # Dynamic - calculated from source dimensions
+        "target_short_side": 480, # Target size for shorter dimension
         "crf": 30,                # Low quality, small file
         "preset": "ultrafast",    # Maximum speed
         "audio_bitrate": "64k",
@@ -42,7 +126,8 @@ RENDER_PROFILES = {
         "estimated_speed": "10-20x realtime"
     },
     "preview_720p": {
-        "scale": "1280:720",      # 720p
+        "scale": None,            # Dynamic - calculated from source dimensions
+        "target_short_side": 720, # Target size for shorter dimension
         "crf": 28,
         "preset": "veryfast",
         "audio_bitrate": "96k",
@@ -107,7 +192,9 @@ def build_ffmpeg_compose_payload(
     cuts: List[Dict[str, str]],
     profile: str = "standard",
     fade_duration: float = 0.025,
-    use_stream_copy: bool = False
+    use_stream_copy: bool = False,
+    video_width: Optional[int] = None,
+    video_height: Optional[int] = None
 ) -> Dict[str, Any]:
     """Build FFmpeg compose payload with audio crossfade.
 
@@ -122,6 +209,8 @@ def build_ffmpeg_compose_payload(
         profile: Render profile name ('preview', 'standard', 'high', '4k')
         fade_duration: Duration of audio crossfade in seconds (default 0.025s = 25ms)
         use_stream_copy: If True, attempt -c copy for single cut (faster)
+        video_width: Original video width (for dynamic scaling)
+        video_height: Original video height (for dynamic scaling)
 
     Returns:
         Dict payload for /v1/ffmpeg/compose endpoint
@@ -130,6 +219,16 @@ def build_ffmpeg_compose_payload(
         raise ValueError("At least one cut is required")
 
     render_settings = get_render_profile(profile)
+
+    # Calculate dynamic scale if profile has target_short_side
+    if render_settings.get("target_short_side") and not render_settings.get("scale"):
+        # Get video dimensions if not provided
+        if video_width is None or video_height is None:
+            video_width, video_height = get_video_dimensions_from_url(video_url)
+
+        if video_width > 0 and video_height > 0:
+            target = render_settings["target_short_side"]
+            render_settings["scale"] = get_dynamic_scale(video_width, video_height, target)
 
     inputs = []
     n_cuts = len(cuts)
@@ -331,7 +430,9 @@ def build_preview_payload(
     video_url: str,
     cuts: List[Dict[str, str]],
     quality: str = "480p",
-    fade_duration: float = 0.025
+    fade_duration: float = 0.025,
+    video_width: Optional[int] = None,
+    video_height: Optional[int] = None
 ) -> Dict[str, Any]:
     """Build FFmpeg compose payload for low-res preview.
 
@@ -342,6 +443,8 @@ def build_preview_payload(
         cuts: List of cuts [{"start": "5.72", "end": "7.22"}, ...]
         quality: Preview quality ('480p' or '720p')
         fade_duration: Duration of audio crossfade in seconds
+        video_width: Original video width (for aspect ratio preservation)
+        video_height: Original video height (for aspect ratio preservation)
 
     Returns:
         Dict payload for /v1/ffmpeg/compose endpoint
@@ -352,7 +455,9 @@ def build_preview_payload(
         cuts=cuts,
         profile=profile,
         fade_duration=fade_duration,
-        use_stream_copy=False  # Always encode for preview to get smaller files
+        use_stream_copy=False,  # Always encode for preview to get smaller files
+        video_width=video_width,
+        video_height=video_height
     )
 
 
@@ -360,7 +465,9 @@ def build_final_render_payload(
     video_url: str,
     cuts: List[Dict[str, str]],
     quality: str = "high",
-    fade_duration: float = 0.025
+    fade_duration: float = 0.025,
+    video_width: Optional[int] = None,
+    video_height: Optional[int] = None
 ) -> Dict[str, Any]:
     """Build FFmpeg compose payload for final high-quality render.
 
@@ -371,6 +478,8 @@ def build_final_render_payload(
         cuts: List of cuts [{"start": "5.72", "end": "7.22"}, ...]
         quality: Output quality ('standard', 'high', '4k')
         fade_duration: Duration of audio crossfade in seconds
+        video_width: Original video width (for aspect ratio preservation)
+        video_height: Original video height (for aspect ratio preservation)
 
     Returns:
         Dict payload for /v1/ffmpeg/compose endpoint
@@ -383,7 +492,9 @@ def build_final_render_payload(
         cuts=cuts,
         profile=quality,
         fade_duration=fade_duration,
-        use_stream_copy=False
+        use_stream_copy=False,
+        video_width=video_width,
+        video_height=video_height
     )
 
 

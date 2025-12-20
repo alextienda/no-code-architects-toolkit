@@ -14,10 +14,12 @@ the analysis of subsequent videos in a project. This enables:
 - Detection of redundant explanations
 - Maintaining narrative continuity
 - Better storytelling decisions
+- Creator profile personalization
 
 Environment Variables:
     GCP_PROJECT_ID: GCP project for Gemini API
     GCP_LOCATION: GCP region (default: us-central1)
+    CREATOR_NAME: Creator's name (default: Alex)
 """
 
 import os
@@ -25,6 +27,8 @@ import json
 import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
+
+from config import CREATOR_GLOBAL_PROFILE
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +40,66 @@ MAX_SUMMARY_CHARS = 1500   # Per video summary
 MAX_PREVIOUS_SUMMARIES = 10  # If more videos, compress older ones
 
 
+def get_effective_creator_profile(project_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Get the effective creator profile by merging global profile with project overrides.
+
+    The global profile defines the creator's brand, audience, style, etc.
+    The project context can override specific fields for campaign/sponsor purposes.
+
+    Args:
+        project_context: Optional project-specific context with overrides
+
+    Returns:
+        Merged creator profile
+    """
+    # Start with global profile
+    profile = CREATOR_GLOBAL_PROFILE.copy()
+
+    if not project_context:
+        return profile
+
+    # Apply project-level overrides
+    if project_context.get("creator_name"):
+        profile["name"] = project_context["creator_name"]
+
+    if project_context.get("specific_audience"):
+        profile["audience"] = project_context["specific_audience"]
+
+    if project_context.get("tone_override"):
+        profile["tone"] = project_context["tone_override"]
+
+    if project_context.get("style_override"):
+        profile["style"] = project_context["style_override"]
+
+    # Add project-specific fields
+    if project_context.get("sponsor"):
+        profile["sponsor"] = project_context["sponsor"]
+
+    if project_context.get("campaign"):
+        profile["campaign"] = project_context["campaign"]
+
+    if project_context.get("focus"):
+        profile["focus"] = project_context["focus"]
+
+    if project_context.get("call_to_action"):
+        profile["call_to_action"] = project_context["call_to_action"]
+
+    if project_context.get("keywords_to_keep"):
+        profile["keywords_to_keep"] = project_context["keywords_to_keep"]
+
+    if project_context.get("keywords_to_avoid"):
+        profile["keywords_to_avoid"] = project_context["keywords_to_avoid"]
+
+    return profile
+
+
 def generate_video_summary(
     workflow_id: str,
     transcript_text: str,
     gemini_xml: Optional[str] = None,
-    sequence_index: int = 0
+    sequence_index: int = 0,
+    project_context: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Generate a semantic summary of a video after analysis.
@@ -51,6 +110,7 @@ def generate_video_summary(
         transcript_text: Full transcript text
         gemini_xml: Optional analyzed XML (to understand what was kept)
         sequence_index: Position in the video sequence (0-based)
+        project_context: Optional project-specific context with creator overrides
 
     Returns:
         Video summary with key points, entities, and narrative function
@@ -59,15 +119,45 @@ def generate_video_summary(
     import google.auth.transport.requests
     import requests
 
+    # Get creator profile (global + project overrides)
+    profile = get_effective_creator_profile(project_context)
+    creator_name = profile.get("name", "Alex")
+
+    # Build creator context section for prompt
+    creator_context = f"""PERFIL DEL CREADOR:
+- Nombre: {creator_name}
+- Brand: {profile.get('brand', 'N/A')}
+- Audiencia: {profile.get('audience', 'N/A')}
+- Estilo: {profile.get('style', 'N/A')}
+- Tono: {profile.get('tone', 'N/A')}"""
+
+    # Add project-specific context if available
+    if project_context:
+        project_parts = []
+        if project_context.get("sponsor"):
+            project_parts.append(f"- Sponsor: {project_context['sponsor']}")
+        if project_context.get("campaign"):
+            project_parts.append(f"- Campaña: {project_context['campaign']}")
+        if project_context.get("focus"):
+            project_parts.append(f"- Enfoque especial: {project_context['focus']}")
+        if project_parts:
+            creator_context += "\n\nCONTEXTO DE ESTE PROYECTO:\n" + "\n".join(project_parts)
+
     # Prepare prompt for summary generation
-    prompt = f"""Analiza este fragmento de video (parte {sequence_index + 1} de una serie) y genera un resumen estructurado.
+    prompt = f"""Eres el asistente de edición de {creator_name}.
+
+{creator_context}
+
+Analiza este fragmento de video (parte {sequence_index + 1} de una serie) y genera un resumen estructurado.
+
+IMPORTANTE: Refiere al creador siempre como "{creator_name}", NUNCA como "el orador" o "el hablante".
 
 TRANSCRIPT:
 {transcript_text[:4000]}
 
 Responde SOLO con JSON válido, sin markdown ni explicaciones:
 {{
-    "summary": "Resumen de 1-2 oraciones del contenido principal",
+    "summary": "Resumen de 1-2 oraciones del contenido principal (usar '{creator_name}' no 'el orador')",
     "key_points": ["punto1", "punto2", "punto3"],
     "entities_mentioned": ["lugar1", "persona1", "concepto1"],
     "topics_covered": ["tema1", "tema2"],
@@ -151,7 +241,8 @@ def _create_fallback_summary(
 def build_context_for_video(
     project_id: str,
     current_sequence_index: int,
-    video_summaries: List[Dict[str, Any]]
+    video_summaries: List[Dict[str, Any]],
+    project_context: Optional[Dict[str, Any]] = None
 ) -> str:
     """
     Build context string from previous video summaries to include
@@ -161,12 +252,17 @@ def build_context_for_video(
         project_id: The project ID
         current_sequence_index: Index of current video (0-based)
         video_summaries: List of summaries from previous videos
+        project_context: Optional project-specific context with creator overrides
 
     Returns:
         Context string to prepend to analysis prompt
     """
     if not video_summaries or current_sequence_index == 0:
         return ""
+
+    # Get creator profile for personalization
+    profile = get_effective_creator_profile(project_context)
+    creator_name = profile.get("name", "Alex")
 
     # Filter only previous videos
     previous_summaries = [
@@ -242,13 +338,14 @@ def build_context_for_video(
         context_parts.append(f"  {', '.join(list(all_topics)[:15])}")
         context_parts.append("")
 
-    # Add instructions
+    # Add instructions with creator name
     context_parts.extend([
         "INSTRUCCIONES PARA ESTE VIDEO:",
         "1. El espectador ya vio los videos anteriores",
         "2. Evita mantener contenido que repita exactamente lo ya dicho",
-        "3. Si el hablante repite un concepto ya explicado, considéralo como candidato a eliminar",
+        f"3. Si {creator_name} repite un concepto ya explicado, considéralo como candidato a eliminar",
         "4. Mantén transiciones que conecten naturalmente con lo anterior",
+        f"5. IMPORTANTE: Refiere al creador siempre como '{creator_name}', nunca como 'el orador' o 'el hablante'",
         "=== FIN CONTEXTO ===",
         ""
     ])
