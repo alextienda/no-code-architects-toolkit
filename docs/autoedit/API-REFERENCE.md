@@ -2,7 +2,7 @@
 
 Documentación completa de la API REST para el pipeline de edición automática de video con AI.
 
-**Versión**: 1.5.0
+**Versión**: 1.6.0
 
 ---
 
@@ -2262,6 +2262,85 @@ Causas comunes:
 
 ---
 
+## Phase 5: ML/AI Pipeline Endpoints
+
+La Fase 5 añade capacidades avanzadas de ML/AI para análisis inteligente, estructura narrativa, recomendaciones visuales y grafos de conocimiento.
+
+**Feature Flags Requeridos:**
+- `PHASE5_AGENTS_ENABLED=true` - Habilita agentes LLM
+- `USE_KNOWLEDGE_GRAPH=true` - Habilita Neo4j graph
+- `USE_FAISS_SEARCH=true` - Habilita búsqueda vectorial
+
+### Intelligence API
+
+Análisis inteligente de redundancias con LLM (calidad vs "first wins").
+
+| Endpoint | Método | Descripción |
+|----------|--------|-------------|
+| `/v1/autoedit/project/{id}/intelligence/analyze-redundancy-quality` | POST | Trigger análisis LLM |
+| `/v1/autoedit/project/{id}/intelligence/redundancy-recommendations` | GET | Obtener recomendaciones |
+| `/v1/autoedit/project/{id}/intelligence/apply-smart-recommendations` | POST | Aplicar selecciones (HITL) |
+
+**Documentación completa:** [FRONTEND-PHASE5-INTELLIGENCE.md](FRONTEND-PHASE5-INTELLIGENCE.md)
+
+### Narrative API
+
+Análisis de estructura narrativa, pacing, arcos emocionales y reordenamiento.
+
+| Endpoint | Método | Descripción |
+|----------|--------|-------------|
+| `/v1/autoedit/project/{id}/narrative/analyze-structure` | POST | Trigger análisis narrativo |
+| `/v1/autoedit/project/{id}/narrative/structure` | GET | Obtener estructura |
+| `/v1/autoedit/project/{id}/narrative/reorder-suggestions` | GET | Sugerencias de reorden |
+| `/v1/autoedit/project/{id}/narrative/apply-reorder` | POST | Aplicar nuevo orden (HITL) |
+
+**Documentación completa:** [FRONTEND-PHASE5-NARRATIVE.md](FRONTEND-PHASE5-NARRATIVE.md)
+
+### Visual API
+
+Recomendaciones de mejoras visuales: B-Roll, diagramas, gráficos, mapas.
+
+| Endpoint | Método | Descripción |
+|----------|--------|-------------|
+| `/v1/autoedit/project/{id}/visual/analyze-needs` | POST | Trigger análisis visual |
+| `/v1/autoedit/project/{id}/visual/recommendations` | GET | Recomendaciones de proyecto |
+| `/v1/autoedit/workflow/{id}/visual/recommendations` | GET | Recomendaciones de workflow |
+| `/v1/autoedit/project/{id}/visual/recommendations/{rec_id}/status` | PATCH | Actualizar status (HITL) |
+
+**Documentación completa:** [FRONTEND-PHASE5-VISUAL.md](FRONTEND-PHASE5-VISUAL.md)
+
+### Graph API
+
+Acceso al grafo de conocimiento Neo4j y consultas semánticas.
+
+| Endpoint | Método | Descripción |
+|----------|--------|-------------|
+| `/v1/autoedit/project/{id}/graph/knowledge-graph` | GET | Grafo completo |
+| `/v1/autoedit/project/{id}/graph/concept-relationships` | GET | Relaciones de conceptos |
+| `/v1/autoedit/project/{id}/graph/query` | POST | Consultas semánticas |
+
+**Query Types disponibles:**
+- `similar_segments` - Segmentos similares (FAISS)
+- `redundancy_clusters` - Clusters de redundancia
+- `topic_videos` - Videos por tema
+- `segment_path` - Camino entre segmentos
+
+**Documentación completa:** [FRONTEND-PHASE5-GRAPH.md](FRONTEND-PHASE5-GRAPH.md)
+
+### Cloud Tasks (Phase 5)
+
+Nuevos handlers para procesamiento asíncrono de ML:
+
+| Task Type | Handler | Descripción |
+|-----------|---------|-------------|
+| `analyze_redundancy_quality` | `/v1/autoedit/tasks/analyze-redundancy-quality` | Análisis de calidad |
+| `analyze_narrative_structure` | `/v1/autoedit/tasks/analyze-narrative-structure` | Estructura narrativa |
+| `analyze_visual_needs` | `/v1/autoedit/tasks/analyze-visual-needs` | Necesidades visuales |
+| `build_knowledge_graph` | `/v1/autoedit/tasks/build-knowledge-graph` | Construcción de grafo |
+| `sync_to_graph` | `/v1/autoedit/tasks/sync-to-graph` | Sincronización a Neo4j |
+
+---
+
 ## Rate Limits
 
 - **Requests por minuto**: 60
@@ -2272,6 +2351,65 @@ Causas comunes:
 ---
 
 ## Changelog
+
+### v1.6.0 (2025-12) - Phase 5: Advanced ML/AI Pipeline
+
+**New Infrastructure:**
+- **FAISS Vector Search**: TwelveLabs Marengo embeddings (1024-dim) for semantic similarity
+- **Neo4j Knowledge Graph**: 5 node types (Project, Video, Segment, Entity, Topic)
+- **Data Synchronization**: GCS ↔ Neo4j ↔ FAISS sync layer
+
+**New LLM Agents:**
+- **Intelligence Analyzer**: LLM-powered redundancy selection (quality-based, not first-wins)
+- **Narrative Analyzer**: Three-Act/Hero's Journey structure detection, pacing, emotional arcs
+- **Visual Analyzer**: B-Roll, diagrams, data viz, maps recommendations with AI prompts
+
+**New API Endpoints (14 endpoints across 4 blueprints):**
+
+Intelligence API:
+- `POST /v1/autoedit/project/{id}/intelligence/analyze-redundancy-quality`
+- `GET /v1/autoedit/project/{id}/intelligence/redundancy-recommendations`
+- `POST /v1/autoedit/project/{id}/intelligence/apply-smart-recommendations`
+
+Narrative API:
+- `POST /v1/autoedit/project/{id}/narrative/analyze-structure`
+- `GET /v1/autoedit/project/{id}/narrative/structure`
+- `GET /v1/autoedit/project/{id}/narrative/reorder-suggestions`
+- `POST /v1/autoedit/project/{id}/narrative/apply-reorder`
+
+Visual API:
+- `POST /v1/autoedit/project/{id}/visual/analyze-needs`
+- `GET /v1/autoedit/project/{id}/visual/recommendations`
+- `GET /v1/autoedit/workflow/{id}/visual/recommendations`
+- `PATCH /v1/autoedit/project/{id}/visual/recommendations/{rec_id}/status`
+
+Graph API:
+- `GET /v1/autoedit/project/{id}/graph/knowledge-graph`
+- `GET /v1/autoedit/project/{id}/graph/concept-relationships`
+- `POST /v1/autoedit/project/{id}/graph/query`
+
+**New Cloud Tasks Handlers:**
+- `analyze_redundancy_quality` - Async LLM quality analysis
+- `analyze_narrative_structure` - Async narrative structure detection
+- `analyze_visual_needs` - Async visual recommendations
+- `build_knowledge_graph` - Async Neo4j graph population
+- `sync_to_graph` - Async data synchronization
+
+**New Feature Flags:**
+- `USE_KNOWLEDGE_GRAPH` - Enable Neo4j integration
+- `USE_FAISS_SEARCH` - Enable vector similarity search
+- `PHASE5_AGENTS_ENABLED` - Enable LLM agents
+
+**New Environment Variables:**
+- `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` - Neo4j connection
+- `GEMINI_API_KEY` - Gemini LLM for analysis
+- `TWELVELABS_API_KEY` - TwelveLabs for video embeddings
+
+**Documentation:**
+- [FRONTEND-PHASE5-INTELLIGENCE.md](FRONTEND-PHASE5-INTELLIGENCE.md)
+- [FRONTEND-PHASE5-NARRATIVE.md](FRONTEND-PHASE5-NARRATIVE.md)
+- [FRONTEND-PHASE5-VISUAL.md](FRONTEND-PHASE5-VISUAL.md)
+- [FRONTEND-PHASE5-GRAPH.md](FRONTEND-PHASE5-GRAPH.md)
 
 ### v1.5.0 (2025-12) - Aspect Ratio + Creator Profile + Enhanced Consolidation
 - **Aspect Ratio Preservation**: Videos now preserve their original aspect ratio
