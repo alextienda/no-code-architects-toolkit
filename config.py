@@ -52,6 +52,30 @@ def validate_env_vars(provider):
 # Each field can be overridden via environment variables.
 # Per-project overrides can be set in project.project_context when creating projects.
 
+# =============================================================================
+# PHASE 5: NEO4J KNOWLEDGE GRAPH CONFIGURATION
+# =============================================================================
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
+
+# =============================================================================
+# PHASE 5: FAISS VECTOR SEARCH CONFIGURATION
+# =============================================================================
+FAISS_INDEX_PATH = os.environ.get("FAISS_INDEX_PATH", "/tmp/faiss_indexes")
+FAISS_USE_GCS = os.environ.get("FAISS_USE_GCS", "true").lower() == "true"
+FAISS_EMBEDDING_DIMENSION = int(os.environ.get("FAISS_EMBEDDING_DIMENSION", "1024"))  # Marengo 3.0
+
+# =============================================================================
+# PHASE 5: FEATURE FLAGS
+# =============================================================================
+USE_KNOWLEDGE_GRAPH = os.environ.get("USE_KNOWLEDGE_GRAPH", "false").lower() == "true"
+USE_FAISS_SEARCH = os.environ.get("USE_FAISS_SEARCH", "false").lower() == "true"
+PHASE5_AGENTS_ENABLED = os.environ.get("PHASE5_AGENTS_ENABLED", "false").lower() == "true"
+
+# =============================================================================
+# AUTOEDIT: CREATOR GLOBAL PROFILE
+# =============================================================================
 CREATOR_GLOBAL_PROFILE = {
     # Creator's name (used instead of "el orador" in summaries)
     "name": os.environ.get("CREATOR_NAME", "Alex"),

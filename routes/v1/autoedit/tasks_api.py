@@ -867,3 +867,500 @@ def task_consolidate():
             pass
 
         return jsonify({"error": str(e), "project_id": project_id}), 500
+
+
+# =============================================================================
+# PHASE 5: ADVANCED ML/AI TASKS
+# =============================================================================
+
+# =============================================================================
+# TASK: ANALYZE REDUNDANCY QUALITY (Phase 5 - Intelligence)
+# =============================================================================
+@v1_autoedit_tasks_api_bp.route('/v1/autoedit/tasks/analyze-redundancy-quality', methods=['POST'])
+@authenticate
+def task_analyze_redundancy_quality():
+    """
+    Cloud Task handler for LLM-powered redundancy analysis.
+
+    Uses FAISS for similarity search, then applies Gemini LLM to evaluate
+    quality and recommend which segment version to keep.
+    """
+    from services.v1.autoedit.intelligence_analyzer import get_intelligence_analyzer
+    from services.v1.autoedit.project import get_project, update_project
+
+    data = request.json or {}
+    project_id = data.get("project_id")
+    threshold = data.get("threshold", 0.85)
+    max_groups = data.get("max_groups", 20)
+
+    if not project_id:
+        return jsonify({"error": "project_id required"}), 400
+
+    logger.info(f"[TASK] Analyze redundancy quality started for project {project_id}")
+
+    try:
+        # Verify project exists
+        project = get_project(project_id)
+        if not project:
+            return jsonify({"error": "Project not found", "project_id": project_id}), 404
+
+        # Get analyzer
+        analyzer = get_intelligence_analyzer()
+        if not analyzer.is_available():
+            return jsonify({
+                "error": "Intelligence analyzer not available",
+                "hint": "Set GEMINI_API_KEY environment variable"
+            }), 503
+
+        # Run analysis
+        result = analyzer.find_and_analyze_redundancies(
+            project_id,
+            similarity_threshold=threshold,
+            max_groups=max_groups
+        )
+
+        # Save to project
+        update_project(project_id, {
+            "intelligence_analysis": {
+                "status": "completed",
+                **result
+            }
+        })
+
+        groups_analyzed = len(result.get("groups", []))
+        logger.info(f"[TASK] Redundancy quality analysis completed for {project_id}: {groups_analyzed} groups")
+
+        return jsonify({
+            "status": "completed",
+            "project_id": project_id,
+            "groups_analyzed": groups_analyzed,
+            "total_pairs": result.get("total_pairs", 0),
+            "analyzed_at": result.get("analyzed_at")
+        }), 200
+
+    except Exception as e:
+        logger.error(f"[TASK] Analyze redundancy quality failed for {project_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e), "project_id": project_id}), 500
+
+
+# =============================================================================
+# TASK: ANALYZE NARRATIVE STRUCTURE (Phase 5 - Narrative)
+# =============================================================================
+@v1_autoedit_tasks_api_bp.route('/v1/autoedit/tasks/analyze-narrative-structure', methods=['POST'])
+@authenticate
+def task_analyze_narrative_structure():
+    """
+    Cloud Task handler for narrative structure analysis.
+
+    Analyzes multi-video project for:
+    - Narrative structure (Three-Act, Hero's Journey, etc.)
+    - Pacing and tension curves
+    - Emotional arcs
+    - Narrative gaps
+    """
+    from services.v1.autoedit.narrative_analyzer import get_narrative_analyzer
+    from services.v1.autoedit.project import get_project, update_project
+    from services.v1.autoedit.workflow import get_workflow
+    from config import CREATOR_GLOBAL_PROFILE
+
+    data = request.json or {}
+    project_id = data.get("project_id")
+    include_pacing = data.get("include_pacing", True)
+    include_emotional = data.get("include_emotional", True)
+    include_gaps = data.get("include_gaps", True)
+
+    if not project_id:
+        return jsonify({"error": "project_id required"}), 400
+
+    logger.info(f"[TASK] Analyze narrative structure started for project {project_id}")
+
+    try:
+        # Verify project exists
+        project = get_project(project_id)
+        if not project:
+            return jsonify({"error": "Project not found", "project_id": project_id}), 404
+
+        # Get analyzer
+        analyzer = get_narrative_analyzer()
+        if not analyzer.is_available():
+            return jsonify({
+                "error": "Narrative analyzer not available",
+                "hint": "Set GEMINI_API_KEY environment variable"
+            }), 503
+
+        # Build project data for analysis
+        workflow_ids = project.get("workflow_ids", [])
+        videos = []
+
+        for wf_id in workflow_ids:
+            wf = get_workflow(wf_id)
+            if wf:
+                videos.append({
+                    "workflow_id": wf_id,
+                    "sequence_index": wf.get("sequence_index", 0),
+                    "title": wf.get("title", wf_id),
+                    "duration_ms": wf.get("stats", {}).get("original_duration_ms", 0),
+                    "summary": wf.get("summary", ""),
+                    "topics": wf.get("analysis", {}).get("main_topics", []),
+                    "emotional_tone": wf.get("analysis", {}).get("emotional_tone", "neutral"),
+                    "key_points": wf.get("analysis", {}).get("key_points", []),
+                    "blocks": wf.get("blocks", [])[:20]  # Limit for context
+                })
+
+        # Get creator context
+        creator_context = project.get("project_context", {})
+        if not creator_context.get("name"):
+            creator_context = {
+                "name": CREATOR_GLOBAL_PROFILE.get("name", "Creator"),
+                "style": CREATOR_GLOBAL_PROFILE.get("style", ""),
+                "typical_content": CREATOR_GLOBAL_PROFILE.get("typical_content", [])
+            }
+
+        project_data = {
+            "project_id": project_id,
+            "videos": videos,
+            "creator_context": creator_context
+        }
+
+        # Run analysis
+        result = analyzer.analyze_structure(project_data)
+
+        # Add optional analyses
+        full_result = {
+            "status": "completed",
+            **result
+        }
+
+        if include_pacing and videos:
+            pacing_results = []
+            for video in videos[:5]:  # Limit for performance
+                pacing = analyzer.analyze_pacing(video)
+                if pacing:
+                    pacing_results.append(pacing)
+            full_result["pacing_analysis"] = pacing_results
+
+        if include_emotional:
+            emotional = analyzer.analyze_emotional_arc(project_data)
+            if emotional:
+                full_result["emotional_arc"] = emotional
+
+        if include_gaps:
+            gaps = analyzer.detect_narrative_gaps(project_data)
+            if gaps:
+                full_result["narrative_gaps"] = gaps
+
+        # Save to project
+        update_project(project_id, {"narrative_analysis": full_result})
+
+        detected_structure = result.get("structure_analysis", {}).get("detected_structure", {}).get("type")
+        logger.info(f"[TASK] Narrative structure analysis completed for {project_id}: {detected_structure}")
+
+        return jsonify({
+            "status": "completed",
+            "project_id": project_id,
+            "detected_structure": detected_structure,
+            "confidence": result.get("structure_analysis", {}).get("detected_structure", {}).get("confidence"),
+            "video_count": len(videos),
+            "analyzed_at": result.get("analyzed_at")
+        }), 200
+
+    except Exception as e:
+        logger.error(f"[TASK] Analyze narrative structure failed for {project_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e), "project_id": project_id}), 500
+
+
+# =============================================================================
+# TASK: ANALYZE VISUAL NEEDS (Phase 5 - Visual)
+# =============================================================================
+@v1_autoedit_tasks_api_bp.route('/v1/autoedit/tasks/analyze-visual-needs', methods=['POST'])
+@authenticate
+def task_analyze_visual_needs():
+    """
+    Cloud Task handler for visual enhancement analysis.
+
+    Analyzes content to identify opportunities for:
+    - B-Roll footage
+    - Diagrams and illustrations
+    - Data visualizations
+    - Maps and geographic elements
+    - Text overlays
+    """
+    from services.v1.autoedit.visual_analyzer import get_visual_analyzer
+    from services.v1.autoedit.project import get_project, update_project
+    from services.v1.autoedit.workflow import get_workflow
+    from config import CREATOR_GLOBAL_PROFILE
+
+    data = request.json or {}
+    project_id = data.get("project_id")
+    workflow_ids_filter = data.get("workflow_ids")  # Optional filter
+    types_filter = data.get("types")  # Optional filter by recommendation type
+
+    if not project_id:
+        return jsonify({"error": "project_id required"}), 400
+
+    logger.info(f"[TASK] Analyze visual needs started for project {project_id}")
+
+    try:
+        # Verify project exists
+        project = get_project(project_id)
+        if not project:
+            return jsonify({"error": "Project not found", "project_id": project_id}), 404
+
+        # Get analyzer
+        analyzer = get_visual_analyzer()
+        if not analyzer.is_available():
+            return jsonify({
+                "error": "Visual analyzer not available",
+                "hint": "Set GEMINI_API_KEY environment variable"
+            }), 503
+
+        # Get creator context
+        project_context = project.get("project_context", {})
+        if not project_context.get("creator_name"):
+            project_context = {
+                "creator_name": CREATOR_GLOBAL_PROFILE.get("name", "Creator"),
+                "content_type": CREATOR_GLOBAL_PROFILE.get("typical_content", ["general"])[0] if CREATOR_GLOBAL_PROFILE.get("typical_content") else "general",
+                "brand_style": CREATOR_GLOBAL_PROFILE.get("style", "professional")
+            }
+
+        # Determine target workflows
+        workflow_ids = workflow_ids_filter or project.get("workflow_ids", [])
+
+        # Analyze each workflow
+        all_recommendations = []
+        workflow_results = []
+
+        for wf_id in workflow_ids:
+            wf = get_workflow(wf_id)
+            if not wf:
+                continue
+
+            workflow_data = {
+                "workflow_id": wf_id,
+                "blocks": wf.get("blocks", []),
+                "analysis": wf.get("analysis", {})
+            }
+
+            result = analyzer.analyze_visual_needs(workflow_data, project_context)
+
+            if result:
+                recs = result.get("visual_recommendations", [])
+
+                # Apply type filter if specified
+                if types_filter:
+                    recs = [r for r in recs if r.get("type") in types_filter]
+
+                all_recommendations.extend(recs)
+                workflow_results.append({
+                    "workflow_id": wf_id,
+                    "recommendation_count": len(recs),
+                    "high_priority": sum(1 for r in recs if r.get("priority") == "high")
+                })
+
+        # Aggregate statistics
+        type_counts = {}
+        priority_counts = {"high": 0, "medium": 0, "low": 0}
+
+        for rec in all_recommendations:
+            rec_type = rec.get("type", "unknown")
+            type_counts[rec_type] = type_counts.get(rec_type, 0) + 1
+            priority = rec.get("priority", "medium")
+            priority_counts[priority] = priority_counts.get(priority, 0) + 1
+
+        # Save analysis
+        import datetime
+        visual_analysis = {
+            "status": "completed",
+            "analyzed_at": datetime.datetime.utcnow().isoformat(),
+            "total_recommendations": len(all_recommendations),
+            "by_type": type_counts,
+            "by_priority": priority_counts,
+            "recommendations": all_recommendations,
+            "workflow_results": workflow_results
+        }
+
+        update_project(project_id, {"visual_analysis": visual_analysis})
+
+        logger.info(f"[TASK] Visual needs analysis completed for {project_id}: {len(all_recommendations)} recommendations")
+
+        return jsonify({
+            "status": "completed",
+            "project_id": project_id,
+            "total_recommendations": len(all_recommendations),
+            "by_type": type_counts,
+            "high_priority_count": priority_counts["high"],
+            "workflows_analyzed": len(workflow_results),
+            "analyzed_at": visual_analysis["analyzed_at"]
+        }), 200
+
+    except Exception as e:
+        logger.error(f"[TASK] Analyze visual needs failed for {project_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e), "project_id": project_id}), 500
+
+
+# =============================================================================
+# TASK: BUILD KNOWLEDGE GRAPH (Phase 5 - Graph)
+# =============================================================================
+@v1_autoedit_tasks_api_bp.route('/v1/autoedit/tasks/build-knowledge-graph', methods=['POST'])
+@authenticate
+def task_build_knowledge_graph():
+    """
+    Cloud Task handler for building Neo4j knowledge graph.
+
+    Creates nodes and relationships for:
+    - Project structure
+    - Video sequences
+    - Segments with embeddings
+    - Entities and topics
+    - Cross-video relationships
+    """
+    from services.v1.autoedit.graph_manager import get_graph_manager
+    from services.v1.autoedit.data_sync import get_data_sync
+    from services.v1.autoedit.project import get_project, update_project
+    from config import USE_KNOWLEDGE_GRAPH
+
+    data = request.json or {}
+    project_id = data.get("project_id")
+    include_segments = data.get("include_segments", True)
+    include_entities = data.get("include_entities", True)
+
+    if not project_id:
+        return jsonify({"error": "project_id required"}), 400
+
+    if not USE_KNOWLEDGE_GRAPH:
+        return jsonify({
+            "error": "Knowledge graph not enabled",
+            "hint": "Set USE_KNOWLEDGE_GRAPH=true"
+        }), 400
+
+    logger.info(f"[TASK] Build knowledge graph started for project {project_id}")
+
+    try:
+        # Verify project exists
+        project = get_project(project_id)
+        if not project:
+            return jsonify({"error": "Project not found", "project_id": project_id}), 404
+
+        # Get graph manager
+        graph = get_graph_manager()
+        if not graph.is_available():
+            return jsonify({
+                "error": "Neo4j not available",
+                "hint": "Check NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD"
+            }), 503
+
+        # Get data sync service
+        data_sync = get_data_sync()
+
+        # Sync project to graph
+        result = data_sync.sync_project_to_graph(
+            project_id,
+            include_segments=include_segments,
+            include_entities=include_entities
+        )
+
+        # Update project with graph sync status
+        import datetime
+        update_project(project_id, {
+            "graph_sync": {
+                "status": "synced",
+                "synced_at": datetime.datetime.utcnow().isoformat(),
+                "nodes_created": result.get("nodes_created", 0),
+                "relationships_created": result.get("relationships_created", 0)
+            }
+        })
+
+        logger.info(f"[TASK] Knowledge graph built for {project_id}: {result.get('nodes_created', 0)} nodes")
+
+        return jsonify({
+            "status": "completed",
+            "project_id": project_id,
+            "nodes_created": result.get("nodes_created", 0),
+            "relationships_created": result.get("relationships_created", 0),
+            "synced_at": datetime.datetime.utcnow().isoformat()
+        }), 200
+
+    except Exception as e:
+        logger.error(f"[TASK] Build knowledge graph failed for {project_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e), "project_id": project_id}), 500
+
+
+# =============================================================================
+# TASK: SYNC TO GRAPH (Phase 5 - Data Sync)
+# =============================================================================
+@v1_autoedit_tasks_api_bp.route('/v1/autoedit/tasks/sync-to-graph', methods=['POST'])
+@authenticate
+def task_sync_to_graph():
+    """
+    Cloud Task handler for incremental graph sync.
+
+    Syncs updated workflow data to Neo4j and FAISS without full rebuild.
+    Used after workflow modifications to keep indexes current.
+    """
+    from services.v1.autoedit.graph_manager import get_graph_manager
+    from services.v1.autoedit.faiss_manager import get_faiss_manager
+    from services.v1.autoedit.data_sync import get_data_sync
+    from services.v1.autoedit.workflow import get_workflow
+    from config import USE_KNOWLEDGE_GRAPH, USE_FAISS_SEARCH
+
+    data = request.json or {}
+    workflow_id = data.get("workflow_id")
+    project_id = data.get("project_id")
+    sync_graph = data.get("sync_graph", True)
+    sync_faiss = data.get("sync_faiss", True)
+
+    if not workflow_id:
+        return jsonify({"error": "workflow_id required"}), 400
+
+    logger.info(f"[TASK] Sync to graph started for workflow {workflow_id}")
+
+    try:
+        # Verify workflow exists
+        workflow = get_workflow(workflow_id)
+        if not workflow:
+            return jsonify({"error": "Workflow not found", "workflow_id": workflow_id}), 404
+
+        results = {
+            "workflow_id": workflow_id,
+            "graph_synced": False,
+            "faiss_synced": False
+        }
+
+        # Sync to Neo4j
+        if sync_graph and USE_KNOWLEDGE_GRAPH:
+            graph = get_graph_manager()
+            if graph.is_available():
+                data_sync = get_data_sync()
+                graph_result = data_sync.sync_workflow_to_graph(workflow_id)
+                results["graph_synced"] = True
+                results["graph_nodes"] = graph_result.get("nodes_updated", 0)
+
+        # Sync to FAISS
+        if sync_faiss and USE_FAISS_SEARCH:
+            faiss = get_faiss_manager()
+            if faiss.is_available() and project_id:
+                data_sync = get_data_sync()
+                faiss_result = data_sync.sync_workflow_embeddings(project_id, workflow_id)
+                results["faiss_synced"] = True
+                results["faiss_vectors"] = faiss_result.get("vectors_updated", 0)
+
+        logger.info(f"[TASK] Sync to graph completed for {workflow_id}")
+
+        return jsonify({
+            "status": "completed",
+            **results
+        }), 200
+
+    except Exception as e:
+        logger.error(f"[TASK] Sync to graph failed for {workflow_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e), "workflow_id": workflow_id}), 500

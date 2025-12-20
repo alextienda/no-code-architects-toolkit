@@ -42,7 +42,13 @@ TASK_TYPES = {
     # Multi-video context tasks (Fase 4B)
     "generate_embeddings": "/v1/autoedit/tasks/generate-embeddings",
     "generate_summary": "/v1/autoedit/tasks/generate-summary",
-    "consolidate": "/v1/autoedit/tasks/consolidate"
+    "consolidate": "/v1/autoedit/tasks/consolidate",
+    # Phase 5: ML/AI Advanced Tasks
+    "analyze_redundancy_quality": "/v1/autoedit/tasks/analyze-redundancy-quality",
+    "analyze_narrative_structure": "/v1/autoedit/tasks/analyze-narrative-structure",
+    "analyze_visual_needs": "/v1/autoedit/tasks/analyze-visual-needs",
+    "build_knowledge_graph": "/v1/autoedit/tasks/build-knowledge-graph",
+    "sync_to_graph": "/v1/autoedit/tasks/sync-to-graph"
 }
 
 # Pipeline flow: what task comes after each task
