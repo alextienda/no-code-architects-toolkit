@@ -36,9 +36,16 @@ COPY gunicorn.conf.py /app/gunicorn.conf.py
 
 # Install additional dependencies not in base image (NO PyAnnote - that will be separate service)
 USER root
-RUN pip install --no-cache-dir google-cloud-workflows google-cloud-tasks twelvelabs>=0.2.0 \
-    # Phase 5: LLM Agents, Knowledge Graph, Vector Search
-    google-generativeai>=0.8.0 neo4j>=5.0.0 faiss-cpu>=1.7.4
+RUN pip install --no-cache-dir google-cloud-workflows google-cloud-tasks twelvelabs>=0.2.0
+
+# Phase 5: LLM Agents (Gemini)
+RUN pip install --no-cache-dir google-generativeai
+
+# Phase 5: Knowledge Graph (Neo4j) - optional, will degrade gracefully if not available
+RUN pip install --no-cache-dir neo4j || echo "neo4j install failed, knowledge graph disabled"
+
+# Phase 5: Vector Search (FAISS) - optional, will degrade gracefully if not available
+RUN pip install --no-cache-dir faiss-cpu || echo "faiss-cpu install failed, vector search disabled"
 
 # Ensure correct permissions for all new directories
 RUN mkdir -p /app/routes/v1/transcription /app/routes/v1/scenes /app/routes/v1/logic /app/routes/v1/autoedit /app/routes/v1/gcp /app/services/transcription_mcp /app/services/v1/autoedit /app/services/v1/video /app/services/v1/gcp /app/infrastructure/prompts && \
