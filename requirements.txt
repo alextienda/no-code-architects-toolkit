@@ -7,7 +7,8 @@ gunicorn
 APScheduler
 srt
 numpy
-torch
+torch>=2.0.0
+torchaudio>=2.1.0
 google-auth
 google-auth-oauthlib
 google-auth-httplib2
@@ -15,8 +16,18 @@ google-api-python-client
 google-api-core
 google-cloud-storage
 google-cloud-run
+google-cloud-tasks
 psutil
 boto3
 Pillow
 matplotlib
 yt-dlp
+# Speaker diarization and identification
+pyannote.audio>=3.1.0
+# Video embeddings for multi-video context
+twelvelabs>=0.2.0
+# Phase 5: Knowledge Graph and Vector Search
+neo4j>=5.0.0
+faiss-cpu>=1.7.4
+# Phase 5: LLM Agents (Intelligence, Narrative, Visual)
+google-generativeai>=0.8.0
