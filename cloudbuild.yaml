@@ -41,9 +41,9 @@ steps:
       - '--timeout'
       - '3600'
       - '--set-env-vars'
-      - 'API_KEY=53528a94ca5ba5e12e9a0c95e5be5f9a8140e893b99f8e6b43b11f53d75382f7,GCP_BUCKET_NAME=nca-toolkit-autoedit,CLOUD_TASKS_QUEUE=autoedit-pipeline,SERVICE_URL=https://nca-toolkit-djwypu7xmq-uc.a.run.app,GCP_PROJECT_ID=autoedit-at,GCP_LOCATION=us-central1,ELEVENLABS_API_KEY=sk_fbfe76620fabd0e4b3c5b6ae62439be3c32f291bd2720579,NCA_TOOLKIT_URL=http://127.0.0.1:8080'
+      - 'API_KEY=53528a94ca5ba5e12e9a0c95e5be5f9a8140e893b99f8e6b43b11f53d75382f7,GCP_BUCKET_NAME=nca-toolkit-autoedit,CLOUD_TASKS_QUEUE=autoedit-pipeline,SERVICE_URL=https://nca-toolkit-djwypu7xmq-uc.a.run.app,GCP_PROJECT_ID=autoedit-at,GCP_LOCATION=us-central1,ELEVENLABS_API_KEY=sk_fbfe76620fabd0e4b3c5b6ae62439be3c32f291bd2720579,TWELVELABS_API_KEY=tlk_2PVJEQK2CQAGPP2W9SMNK1531KVC,NCA_TOOLKIT_URL=http://127.0.0.1:8080,PHASE5_AGENTS_ENABLED=true'
       - '--set-secrets'
-      - 'GCP_SA_CREDENTIALS=nca-toolkit-sa-key:latest'
+      - 'GCP_SA_CREDENTIALS=nca-toolkit-sa-key:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest'
       - '--service-account'
       - 'nca-toolkit-sa@autoedit-at.iam.gserviceaccount.com'
 
