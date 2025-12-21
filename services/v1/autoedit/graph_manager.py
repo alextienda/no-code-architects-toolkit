@@ -886,3 +886,9 @@ class Neo4jManager:
 def get_neo4j_manager() -> Neo4jManager:
     """Get the Neo4j manager singleton instance."""
     return Neo4jManager()
+
+
+# Alias for backwards compatibility
+def get_graph_manager() -> Neo4jManager:
+    """Alias for get_neo4j_manager. Used by graph_api.py and tasks_api.py."""
+    return get_neo4j_manager()
