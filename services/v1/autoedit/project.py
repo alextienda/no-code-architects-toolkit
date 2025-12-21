@@ -269,13 +269,15 @@ class ProjectManager:
 
             # Update fields
             for key, value in updates.items():
-                if key in data:
-                    data[key] = value
-                elif key.startswith("stats."):
+                if key.startswith("stats."):
+                    # Handle nested stats updates
                     stat_key = key.split(".", 1)[1]
                     if data["stats"] is None:
                         data["stats"] = {}
                     data["stats"][stat_key] = value
+                else:
+                    # Update or add any field (including new Phase 5 analysis fields)
+                    data[key] = value
 
             data["updated_at"] = datetime.utcnow().isoformat()
 
