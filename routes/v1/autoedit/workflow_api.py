@@ -19,6 +19,8 @@ Provides REST API for AutoEdit workflow management:
 - DELETE /v1/autoedit/workflow/{id} - Delete workflow
 - GET /v1/autoedit/workflow/{id}/analysis - Get XML for HITL 1
 - PUT /v1/autoedit/workflow/{id}/analysis - Submit reviewed XML
+- POST /v1/autoedit/workflow/{id}/retry - Retry a stuck workflow
+- POST /v1/autoedit/workflow/{id}/fail - Manually mark workflow as failed
 """
 
 import os
@@ -716,4 +718,256 @@ def analyze_workflow(job_id, data, **kwargs):
         import traceback
         logger.error(traceback.format_exc())
         manager.set_status(workflow_id, "error", error=str(e))
+        return {"error": str(e), "workflow_id": workflow_id}, endpoint, 500
+
+
+# =============================================================================
+# WORKFLOW RECOVERY (RETRY / FAIL)
+# =============================================================================
+
+# Mapping of stuck states to the step that should be retried
+RETRY_STEP_MAPPING = {
+    "transcribing": "transcription",
+    "analyzing": "analysis",
+    "processing": "process",
+    "generating_preview": "preview",
+    "rendering": "render"
+}
+
+
+@v1_autoedit_workflow_api_bp.route('/v1/autoedit/workflow/<workflow_id>/retry', methods=['POST'])
+@authenticate
+@validate_payload({
+    "type": "object",
+    "properties": {
+        "from_step": {
+            "type": "string",
+            "enum": ["transcription", "analysis", "process", "preview", "render"]
+        }
+    },
+    "additionalProperties": False
+})
+@queue_task_wrapper(bypass_queue=True)
+def retry_workflow(job_id, data, **kwargs):
+    """Retry a stuck workflow from its current step or a specified step.
+
+    This endpoint:
+    1. Resets the workflow status to allow re-processing
+    2. Re-enqueues the Cloud Task for the step
+    3. Preserves all existing data (video_url, transcript, etc.)
+
+    Request body:
+        {
+            "from_step": "transcription"  // optional: restart from specific step
+        }
+
+    Returns:
+        {
+            "status": "success",
+            "workflow_id": "...",
+            "previous_status": "transcribing",
+            "new_status": "created",
+            "step_to_retry": "transcription",
+            "message": "Workflow queued for retry"
+        }
+    """
+    workflow_id = request.view_args.get('workflow_id')
+    from_step = data.get('from_step')
+    endpoint = f"/v1/autoedit/workflow/{workflow_id}/retry"
+
+    logger.info(f"Retry requested for workflow {workflow_id}, from_step={from_step}")
+
+    try:
+        manager = get_workflow_manager()
+        workflow = manager.get(workflow_id)
+
+        if not workflow:
+            return {
+                "error": "Workflow not found",
+                "workflow_id": workflow_id
+            }, endpoint, 404
+
+        previous_status = workflow["status"]
+
+        # Determine which step to retry
+        if from_step:
+            step_to_retry = from_step
+        else:
+            # Auto-detect from current status
+            step_to_retry = RETRY_STEP_MAPPING.get(previous_status)
+            if not step_to_retry:
+                return {
+                    "error": f"Cannot auto-detect retry step for status '{previous_status}'. "
+                             f"Specify 'from_step' parameter.",
+                    "workflow_id": workflow_id,
+                    "current_status": previous_status,
+                    "valid_stuck_states": list(RETRY_STEP_MAPPING.keys())
+                }, endpoint, 400
+
+        # Map step to new status and task type
+        step_config = {
+            "transcription": {"new_status": "created", "task_type": "transcribe"},
+            "analysis": {"new_status": "transcribed", "task_type": "analyze"},
+            "process": {"new_status": "xml_approved", "task_type": "process"},
+            "preview": {"new_status": "processing", "task_type": "preview"},
+            "render": {"new_status": "pending_review_2", "task_type": "render"}
+        }
+
+        config = step_config.get(step_to_retry)
+        if not config:
+            return {
+                "error": f"Invalid step: {step_to_retry}",
+                "valid_steps": list(step_config.keys())
+            }, endpoint, 400
+
+        new_status = config["new_status"]
+        task_type = config["task_type"]
+
+        # Reset workflow status
+        manager.set_status(workflow_id, new_status)
+
+        # Clear any previous error
+        manager.update(workflow_id, {
+            "error": None,
+            "retry_count": workflow.get("retry_count", 0) + 1,
+            "last_retry_at": __import__('datetime').datetime.utcnow().isoformat()
+        })
+
+        # Enqueue the task
+        from services.v1.autoedit.task_queue import enqueue_task
+        enqueue_result = enqueue_task(
+            task_type=task_type,
+            workflow_id=workflow_id,
+            payload={"retry": True, "from_status": previous_status}
+        )
+
+        # Update status to "in progress" state
+        in_progress_status = {
+            "transcription": "transcribing",
+            "analysis": "analyzing",
+            "process": "processing",
+            "preview": "generating_preview",
+            "render": "rendering"
+        }
+        manager.set_status(workflow_id, in_progress_status[step_to_retry])
+
+        return {
+            "status": "success",
+            "workflow_id": workflow_id,
+            "previous_status": previous_status,
+            "new_status": in_progress_status[step_to_retry],
+            "step_to_retry": step_to_retry,
+            "task_enqueued": enqueue_result.get("success", False),
+            "message": f"Workflow queued for retry from {step_to_retry}"
+        }, endpoint, 200
+
+    except Exception as e:
+        logger.error(f"Error retrying workflow {workflow_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {"error": str(e), "workflow_id": workflow_id}, endpoint, 500
+
+
+@v1_autoedit_workflow_api_bp.route('/v1/autoedit/workflow/<workflow_id>/fail', methods=['POST'])
+@authenticate
+@validate_payload({
+    "type": "object",
+    "properties": {
+        "reason": {"type": "string", "minLength": 1, "maxLength": 500}
+    },
+    "required": ["reason"],
+    "additionalProperties": False
+})
+@queue_task_wrapper(bypass_queue=True)
+def fail_workflow(job_id, data, **kwargs):
+    """Manually mark a workflow as failed.
+
+    Use this to:
+    - Mark stuck workflows as failed so the project can proceed
+    - Document the reason for failure
+    - Allow the project stats to update correctly
+
+    Request body:
+        {
+            "reason": "ElevenLabs timeout after 60 minutes"
+        }
+
+    Returns:
+        {
+            "status": "success",
+            "workflow_id": "...",
+            "previous_status": "transcribing",
+            "new_status": "error",
+            "message": "Workflow marked as failed"
+        }
+    """
+    workflow_id = request.view_args.get('workflow_id')
+    reason = data.get('reason', 'Manually marked as failed')
+    endpoint = f"/v1/autoedit/workflow/{workflow_id}/fail"
+
+    logger.info(f"Manual fail requested for workflow {workflow_id}: {reason}")
+
+    try:
+        manager = get_workflow_manager()
+        workflow = manager.get(workflow_id)
+
+        if not workflow:
+            return {
+                "error": "Workflow not found",
+                "workflow_id": workflow_id
+            }, endpoint, 404
+
+        previous_status = workflow["status"]
+
+        # Don't allow failing already completed workflows
+        if previous_status == "completed":
+            return {
+                "error": "Cannot fail a completed workflow",
+                "workflow_id": workflow_id,
+                "current_status": previous_status
+            }, endpoint, 400
+
+        # Already in error state
+        if previous_status == "error":
+            return {
+                "status": "already_failed",
+                "workflow_id": workflow_id,
+                "previous_status": previous_status,
+                "existing_error": workflow.get("error"),
+                "message": "Workflow was already in error state"
+            }, endpoint, 200
+
+        # Mark as failed
+        manager.set_status(workflow_id, "error", error=reason)
+
+        # Record failure details
+        manager.update(workflow_id, {
+            "failed_at": __import__('datetime').datetime.utcnow().isoformat(),
+            "failed_from_status": previous_status,
+            "manual_fail": True
+        })
+
+        # Update project stats if this workflow belongs to a project
+        project_id = workflow.get("project_id")
+        if project_id:
+            try:
+                from services.v1.autoedit.project import refresh_project_stats
+                refresh_project_stats(project_id)
+                logger.info(f"Refreshed stats for project {project_id} after failing workflow {workflow_id}")
+            except Exception as stats_error:
+                logger.warning(f"Could not refresh project stats: {stats_error}")
+
+        return {
+            "status": "success",
+            "workflow_id": workflow_id,
+            "previous_status": previous_status,
+            "new_status": "error",
+            "reason": reason,
+            "message": "Workflow marked as failed"
+        }, endpoint, 200
+
+    except Exception as e:
+        logger.error(f"Error failing workflow {workflow_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return {"error": str(e), "workflow_id": workflow_id}, endpoint, 500

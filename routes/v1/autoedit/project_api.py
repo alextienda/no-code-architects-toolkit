@@ -21,6 +21,7 @@ Endpoints:
     DELETE /v1/autoedit/project/<id>/videos/<wf>   - Remove video
     POST   /v1/autoedit/project/<id>/start         - Start batch processing
     GET    /v1/autoedit/project/<id>/stats         - Get statistics
+    POST   /v1/autoedit/project/<id>/retry-stuck   - Retry stuck workflows
 """
 
 from functools import wraps
@@ -197,6 +198,30 @@ START_PROJECT_SCHEMA = {
             "type": "boolean",
             "default": False,
             "description": "Include failed workflows in processing (retry failed)"
+        }
+    },
+    "additionalProperties": False
+}
+
+RETRY_STUCK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "workflow_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional: specific workflow IDs to retry (must belong to project). If omitted, all stuck workflows are retried."
+        },
+        "stuck_threshold_minutes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1440,
+            "default": 30,
+            "description": "Workflows in processing states for longer than this are considered stuck (default: 30 min)"
+        },
+        "include_error": {
+            "type": "boolean",
+            "default": False,
+            "description": "Also retry workflows in error state"
         }
     },
     "additionalProperties": False
@@ -785,3 +810,258 @@ def get_project_stats_endpoint(project_id):
             "status": "error",
             "error": str(e)
         }), 500
+
+
+# =============================================================================
+# WORKFLOW RECOVERY ENDPOINTS
+# =============================================================================
+
+# Processing states that indicate a workflow might be stuck
+STUCK_STATES = ["transcribing", "analyzing", "processing", "generating_preview", "rendering"]
+
+# Mapping of stuck states to the step that should be retried
+RETRY_STEP_MAPPING = {
+    "transcribing": "transcription",
+    "analyzing": "analysis",
+    "processing": "process",
+    "generating_preview": "preview",
+    "rendering": "render",
+    "error": "auto"  # Auto-detect from error details
+}
+
+
+@v1_autoedit_project_bp.route('/v1/autoedit/project/<project_id>/retry-stuck', methods=['POST'])
+@authenticate
+@validate_payload(RETRY_STUCK_SCHEMA)
+@queue_task_wrapper(bypass_queue=True)
+def retry_stuck_workflows_endpoint(job_id, data, project_id=None):
+    """
+    Retry all stuck workflows in a project.
+
+    A workflow is considered "stuck" if it's been in a processing state
+    (transcribing, analyzing, processing, etc.) for longer than the threshold.
+
+    Request:
+        {
+            "workflow_ids": ["wf_1", "wf_2"],  // Optional: specific workflows to retry
+            "stuck_threshold_minutes": 30,     // Optional: default 30 min
+            "include_error": false             // Optional: also retry error state workflows
+        }
+
+    Response:
+        {
+            "status": "success",
+            "project_id": "proj_abc123",
+            "retried": [
+                {"workflow_id": "wf_1", "previous_status": "transcribing", "step": "transcription"}
+            ],
+            "skipped": [
+                {"workflow_id": "wf_2", "reason": "not stuck (last update 5 min ago)"}
+            ],
+            "errors": []
+        }
+    """
+    from datetime import datetime, timedelta
+    from services.v1.autoedit.task_queue import enqueue_task
+    from services.v1.autoedit.workflow import get_workflow_manager
+
+    if project_id is None:
+        project_id = request.view_args.get('project_id')
+
+    endpoint = f"/v1/autoedit/project/{project_id}/retry-stuck"
+
+    try:
+        project_data = get_project(project_id)
+        if not project_data:
+            return {
+                "status": "error",
+                "error": "Project not found",
+                "project_id": project_id
+            }, endpoint, 404
+
+        all_workflow_ids = project_data.get("workflow_ids", [])
+        if not all_workflow_ids:
+            return {
+                "status": "success",
+                "message": "No workflows in project",
+                "project_id": project_id,
+                "retried": [],
+                "skipped": []
+            }, endpoint, 200
+
+        # Get parameters
+        specified_ids = data.get("workflow_ids")
+        stuck_threshold = data.get("stuck_threshold_minutes", 30)
+        include_error = data.get("include_error", False)
+
+        # Determine which workflows to check
+        if specified_ids:
+            # Validate specified IDs belong to project
+            target_ids = [wf_id for wf_id in specified_ids if wf_id in all_workflow_ids]
+            invalid_ids = [wf_id for wf_id in specified_ids if wf_id not in all_workflow_ids]
+        else:
+            target_ids = all_workflow_ids
+            invalid_ids = []
+
+        # Calculate threshold time
+        threshold_time = datetime.utcnow() - timedelta(minutes=stuck_threshold)
+
+        # Results tracking
+        retried = []
+        skipped = []
+        errors = []
+
+        # Get workflow manager
+        wf_manager = get_workflow_manager()
+
+        # Check each workflow
+        for wf_id in target_ids:
+            try:
+                workflow = wf_manager.get(wf_id)
+                if not workflow:
+                    skipped.append({
+                        "workflow_id": wf_id,
+                        "reason": "workflow not found"
+                    })
+                    continue
+
+                status = workflow.get("status")
+                updated_at_str = workflow.get("updated_at")
+
+                # Check if status is one that can be stuck
+                is_processing_state = status in STUCK_STATES
+                is_error_state = status == "error" and include_error
+
+                if not is_processing_state and not is_error_state:
+                    skipped.append({
+                        "workflow_id": wf_id,
+                        "status": status,
+                        "reason": f"status '{status}' is not a stuck state"
+                    })
+                    continue
+
+                # Parse updated_at to check if it's stuck
+                try:
+                    if updated_at_str:
+                        # Handle both ISO formats
+                        if "T" in updated_at_str:
+                            updated_at = datetime.fromisoformat(updated_at_str.replace("Z", "+00:00").replace("+00:00", ""))
+                        else:
+                            updated_at = datetime.strptime(updated_at_str, "%Y-%m-%d %H:%M:%S")
+                    else:
+                        # No timestamp, consider it stuck
+                        updated_at = threshold_time - timedelta(minutes=1)
+                except (ValueError, TypeError):
+                    # Can't parse timestamp, consider it stuck
+                    updated_at = threshold_time - timedelta(minutes=1)
+
+                # Check if stuck (hasn't been updated within threshold)
+                is_stuck = updated_at < threshold_time
+
+                if not is_stuck and not is_error_state:
+                    minutes_since_update = (datetime.utcnow() - updated_at).total_seconds() / 60
+                    skipped.append({
+                        "workflow_id": wf_id,
+                        "status": status,
+                        "reason": f"not stuck (last update {int(minutes_since_update)} min ago, threshold {stuck_threshold} min)"
+                    })
+                    continue
+
+                # Determine which step to retry
+                step_to_retry = RETRY_STEP_MAPPING.get(status)
+                if not step_to_retry or step_to_retry == "auto":
+                    # For error state, try to determine from error details
+                    failed_from = workflow.get("failed_from_status") or workflow.get("error_details", {}).get("from_status")
+                    if failed_from:
+                        step_to_retry = RETRY_STEP_MAPPING.get(failed_from, "transcription")
+                    else:
+                        step_to_retry = "transcription"  # Default to start
+
+                # Map step to new status and task type
+                step_config = {
+                    "transcription": {"new_status": "created", "task_type": "transcribe", "in_progress": "transcribing"},
+                    "analysis": {"new_status": "transcribed", "task_type": "analyze", "in_progress": "analyzing"},
+                    "process": {"new_status": "xml_approved", "task_type": "process", "in_progress": "processing"},
+                    "preview": {"new_status": "processing", "task_type": "preview", "in_progress": "generating_preview"},
+                    "render": {"new_status": "pending_review_2", "task_type": "render", "in_progress": "rendering"}
+                }
+
+                config = step_config.get(step_to_retry)
+                if not config:
+                    errors.append({
+                        "workflow_id": wf_id,
+                        "error": f"Unknown step: {step_to_retry}"
+                    })
+                    continue
+
+                # Reset workflow status
+                wf_manager.set_status(wf_id, config["new_status"])
+
+                # Clear error and update retry metadata
+                wf_manager.update(wf_id, {
+                    "error": None,
+                    "retry_count": workflow.get("retry_count", 0) + 1,
+                    "last_retry_at": datetime.utcnow().isoformat(),
+                    "retry_source": "project_bulk_retry"
+                })
+
+                # Enqueue the task
+                enqueue_result = enqueue_task(
+                    task_type=config["task_type"],
+                    workflow_id=wf_id,
+                    payload={
+                        "retry": True,
+                        "from_status": status,
+                        "project_retry": True
+                    }
+                )
+
+                # Update status to in-progress
+                wf_manager.set_status(wf_id, config["in_progress"])
+
+                retried.append({
+                    "workflow_id": wf_id,
+                    "previous_status": status,
+                    "step": step_to_retry,
+                    "task_enqueued": enqueue_result.get("success", False)
+                })
+
+            except Exception as e:
+                logger.error(f"Error processing workflow {wf_id}: {e}")
+                errors.append({
+                    "workflow_id": wf_id,
+                    "error": str(e)
+                })
+
+        # Add invalid IDs to skipped
+        for wf_id in invalid_ids:
+            skipped.append({
+                "workflow_id": wf_id,
+                "reason": "workflow not in project"
+            })
+
+        # Refresh project stats
+        refresh_project_stats(project_id)
+
+        return {
+            "status": "success",
+            "project_id": project_id,
+            "stuck_threshold_minutes": stuck_threshold,
+            "retried_count": len(retried),
+            "skipped_count": len(skipped),
+            "error_count": len(errors),
+            "retried": retried,
+            "skipped": skipped,
+            "errors": errors if errors else None,
+            "message": f"Retried {len(retried)} workflow(s), skipped {len(skipped)}"
+        }, endpoint, 200
+
+    except Exception as e:
+        logger.error(f"Error in retry-stuck for project {project_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {
+            "status": "error",
+            "error": str(e),
+            "project_id": project_id
+        }, endpoint, 500
