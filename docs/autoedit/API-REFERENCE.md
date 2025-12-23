@@ -2,7 +2,7 @@
 
 Documentación completa de la API REST para el pipeline de edición automática de video con AI.
 
-**Versión**: 1.6.0
+**Versión**: 1.6.1
 
 ---
 
@@ -529,6 +529,9 @@ const workflowId = createData.workflow_id;  // undefined!
 | GET | `/v1/autoedit/workflow/{id}/result` | Obtener video final |
 | POST | `/v1/autoedit/workflow/{id}/rerender` | Re-renderizar con nueva calidad |
 | GET | `/v1/autoedit/workflow/{id}/estimate` | Estimar tiempo de render |
+| POST | `/v1/autoedit/workflow/{id}/retry` | **Reintentar workflow stuck** |
+| POST | `/v1/autoedit/workflow/{id}/fail` | **Marcar workflow como fallido** |
+| POST | `/v1/autoedit/project/{id}/retry-stuck` | **Reintentar workflows stuck en batch** |
 
 ---
 
@@ -2243,7 +2246,316 @@ Causas comunes:
 | `regenerating_preview` | Regenerando preview | Esperar... | (polling con GET) |
 | `rendering` | Procesando video final | Esperar... | `GET /workflow/{id}/render` |
 | `completed` | Video final listo | Obtener resultado | `GET /workflow/{id}/result` |
-| `error` | Error en algún paso | Ver detalles del error | `GET /workflow/{id}` |
+| `error` | Error en algún paso | Ver detalles del error o retry | `GET /workflow/{id}`, `POST /workflow/{id}/retry` |
+
+---
+
+## Workflow Recovery (Retry / Fail)
+
+Los endpoints de recuperación permiten manejar workflows atascados (stuck) o marcarlos como fallidos manualmente.
+
+### Estados "Stuck"
+
+Un workflow está "stuck" cuando permanece demasiado tiempo en un estado de procesamiento:
+
+| Estado | Descripción | Tiempo típico esperado |
+|--------|-------------|----------------------|
+| `transcribing` | Esperando ElevenLabs | 30-120 segundos |
+| `analyzing` | Esperando Gemini | 20-60 segundos |
+| `processing` | Mapeando XML a blocks | 5-15 segundos |
+| `generating_preview` | FFmpeg generando preview | 10-45 segundos |
+| `rendering` | FFmpeg render final | 60-180 segundos |
+
+**Umbral recomendado:** Si un workflow lleva más de **30 minutos** en cualquiera de estos estados, probablemente está stuck.
+
+---
+
+### POST /v1/autoedit/workflow/{workflow_id}/retry
+
+Reintentar un workflow atascado desde su paso actual o desde un paso específico.
+
+**Request Body:**
+
+```json
+{
+  "from_step": "transcription"
+}
+```
+
+| Campo | Tipo | Requerido | Descripción |
+|-------|------|-----------|-------------|
+| `from_step` | string | No | Paso desde el cual reintentar: `transcription`, `analysis`, `process`, `preview`, `render`. Si no se especifica, se auto-detecta del estado actual. |
+
+**Comportamiento:**
+1. Resetea el estado del workflow para permitir re-procesamiento
+2. Re-encola el Cloud Task para el paso especificado
+3. Preserva todos los datos existentes (video_url, transcript, etc.)
+4. Incrementa contador de reintentos
+
+**Response (200 OK):**
+
+```json
+{
+  "status": "success",
+  "workflow_id": "550e8400-...",
+  "previous_status": "transcribing",
+  "new_status": "transcribing",
+  "step_to_retry": "transcription",
+  "task_enqueued": true,
+  "message": "Workflow queued for retry from transcription"
+}
+```
+
+**Response cuando no se puede auto-detectar (400 Bad Request):**
+
+```json
+{
+  "error": "Cannot auto-detect retry step for status 'pending_review_1'. Specify 'from_step' parameter.",
+  "workflow_id": "550e8400-...",
+  "current_status": "pending_review_1",
+  "valid_stuck_states": ["transcribing", "analyzing", "processing", "generating_preview", "rendering"]
+}
+```
+
+**cURL Example:**
+
+```bash
+# Auto-detectar paso a reintentar
+curl -X POST "https://nca-toolkit.../v1/autoedit/workflow/550e8400.../retry" \
+  -H "X-API-Key: tu_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Reintentar desde paso específico
+curl -X POST "https://nca-toolkit.../v1/autoedit/workflow/550e8400.../retry" \
+  -H "X-API-Key: tu_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"from_step": "analysis"}'
+```
+
+---
+
+### POST /v1/autoedit/workflow/{workflow_id}/fail
+
+Marcar manualmente un workflow como fallido.
+
+**Request Body:**
+
+```json
+{
+  "reason": "ElevenLabs timeout after 60 minutes"
+}
+```
+
+| Campo | Tipo | Requerido | Descripción |
+|-------|------|-----------|-------------|
+| `reason` | string | Sí | Razón del fallo (1-500 caracteres) |
+
+**Uso:**
+- Marcar workflows irrecuperables como fallidos
+- Documentar la razón del fallo para auditoría
+- Permitir que las stats del proyecto se actualicen correctamente
+- Liberar recursos de Cloud Tasks
+
+**Response (200 OK):**
+
+```json
+{
+  "status": "success",
+  "workflow_id": "550e8400-...",
+  "previous_status": "transcribing",
+  "new_status": "error",
+  "reason": "ElevenLabs timeout after 60 minutes",
+  "message": "Workflow marked as failed"
+}
+```
+
+**Response si ya estaba fallido (200 OK):**
+
+```json
+{
+  "status": "already_failed",
+  "workflow_id": "550e8400-...",
+  "previous_status": "error",
+  "existing_error": "Previous error message",
+  "message": "Workflow was already in error state"
+}
+```
+
+**Response si está completado (400 Bad Request):**
+
+```json
+{
+  "error": "Cannot fail a completed workflow",
+  "workflow_id": "550e8400-...",
+  "current_status": "completed"
+}
+```
+
+**cURL Example:**
+
+```bash
+curl -X POST "https://nca-toolkit.../v1/autoedit/workflow/550e8400.../fail" \
+  -H "X-API-Key: tu_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "Cloud Tasks timeout - ElevenLabs no respondió en 60 minutos"}'
+```
+
+---
+
+### POST /v1/autoedit/project/{project_id}/retry-stuck
+
+Reintentar en lote todos los workflows atascados de un proyecto.
+
+**Request Body:**
+
+```json
+{
+  "workflow_ids": ["wf_1", "wf_2"],
+  "stuck_threshold_minutes": 30,
+  "include_error": false
+}
+```
+
+| Campo | Tipo | Requerido | Default | Descripción |
+|-------|------|-----------|---------|-------------|
+| `workflow_ids` | array | No | null | IDs específicos a reintentar. Si se omite, verifica todos los workflows del proyecto. |
+| `stuck_threshold_minutes` | integer | No | 30 | Workflows en estados de procesamiento por más de este tiempo se consideran stuck (1-1440 min). |
+| `include_error` | boolean | No | false | También reintentar workflows en estado `error`. |
+
+**Comportamiento:**
+1. Itera sobre los workflows especificados (o todos si no se especifican)
+2. Para cada workflow:
+   - Verifica si está en un estado "stuck" (transcribing, analyzing, etc.)
+   - Verifica si ha pasado más tiempo del umbral desde su última actualización
+   - Si está stuck, lo reintenta automáticamente
+   - Si no está stuck, lo omite con razón
+3. Retorna resumen de retried/skipped/errors
+
+**Response (200 OK):**
+
+```json
+{
+  "status": "success",
+  "project_id": "proj_abc123",
+  "stuck_threshold_minutes": 30,
+  "retried_count": 3,
+  "skipped_count": 7,
+  "error_count": 0,
+  "retried": [
+    {
+      "workflow_id": "wf_1",
+      "previous_status": "transcribing",
+      "step": "transcription",
+      "task_enqueued": true
+    },
+    {
+      "workflow_id": "wf_2",
+      "previous_status": "analyzing",
+      "step": "analysis",
+      "task_enqueued": true
+    }
+  ],
+  "skipped": [
+    {
+      "workflow_id": "wf_3",
+      "status": "completed",
+      "reason": "status 'completed' is not a stuck state"
+    },
+    {
+      "workflow_id": "wf_4",
+      "status": "transcribing",
+      "reason": "not stuck (last update 5 min ago, threshold 30 min)"
+    },
+    {
+      "workflow_id": "wf_5",
+      "status": "pending_review_1",
+      "reason": "status 'pending_review_1' is not a stuck state"
+    }
+  ],
+  "errors": null,
+  "message": "Retried 3 workflow(s), skipped 7"
+}
+```
+
+**cURL Example:**
+
+```bash
+# Reintentar todos los stuck (umbral 30 min por defecto)
+curl -X POST "https://nca-toolkit.../v1/autoedit/project/proj_abc123/retry-stuck" \
+  -H "X-API-Key: tu_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Reintentar con umbral de 15 minutos, incluyendo errores
+curl -X POST "https://nca-toolkit.../v1/autoedit/project/proj_abc123/retry-stuck" \
+  -H "X-API-Key: tu_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"stuck_threshold_minutes": 15, "include_error": true}'
+
+# Reintentar solo workflows específicos
+curl -X POST "https://nca-toolkit.../v1/autoedit/project/proj_abc123/retry-stuck" \
+  -H "X-API-Key: tu_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"workflow_ids": ["wf_1", "wf_2"]}'
+```
+
+---
+
+### Frontend: Patrón de Monitoreo y Recuperación
+
+**Recomendación de UI:**
+
+```javascript
+// Función para verificar workflows stuck en un proyecto
+async function checkStuckWorkflows(projectId, thresholdMinutes = 30) {
+  const response = await fetch(`/v1/autoedit/project/${projectId}/videos`, {
+    headers: { 'X-API-Key': API_KEY }
+  });
+  const { videos } = await response.json();
+
+  const now = new Date();
+  const stuck = videos.filter(v => {
+    const stuckStates = ['transcribing', 'analyzing', 'processing', 'generating_preview', 'rendering'];
+    if (!stuckStates.includes(v.status)) return false;
+
+    const updatedAt = new Date(v.updated_at);
+    const minutesSinceUpdate = (now - updatedAt) / 1000 / 60;
+    return minutesSinceUpdate > thresholdMinutes;
+  });
+
+  return stuck;
+}
+
+// Mostrar alerta si hay workflows stuck
+const stuckWorkflows = await checkStuckWorkflows('proj_123');
+if (stuckWorkflows.length > 0) {
+  showAlert(`${stuckWorkflows.length} video(s) están atascados. ¿Reintentar?`, {
+    onRetry: () => retryStuckWorkflows('proj_123'),
+    onFail: () => failStuckWorkflows('proj_123', stuckWorkflows)
+  });
+}
+
+// Reintentar todos los stuck
+async function retryStuckWorkflows(projectId) {
+  const response = await fetch(`/v1/autoedit/project/${projectId}/retry-stuck`, {
+    method: 'POST',
+    headers: { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stuck_threshold_minutes: 30 })
+  });
+  const result = await response.json();
+  showToast(`Reintentando ${result.response.retried_count} workflow(s)`);
+}
+```
+
+**Estados en UI:**
+
+| Estado Visual | Color | Acción Disponible |
+|---------------|-------|-------------------|
+| Procesando (normal) | 🔵 Azul | Esperar |
+| Stuck (> umbral) | 🟠 Naranja | Retry / Fail |
+| Error | 🔴 Rojo | Retry / Ver detalles |
+| Completado | 🟢 Verde | Ver resultado |
 
 ### Flujo Típico de Llamadas
 
@@ -2351,6 +2663,34 @@ Nuevos handlers para procesamiento asíncrono de ML:
 ---
 
 ## Changelog
+
+### v1.6.1 (2025-12) - Workflow Recovery Endpoints
+
+**Nuevos Endpoints de Recuperación:**
+- `POST /v1/autoedit/workflow/{id}/retry` - Reintentar workflow stuck
+- `POST /v1/autoedit/workflow/{id}/fail` - Marcar workflow como fallido manualmente
+- `POST /v1/autoedit/project/{id}/retry-stuck` - Reintentar en batch todos los workflows stuck
+
+**Funcionalidades:**
+- Auto-detección del paso a reintentar basado en estado actual
+- Umbral configurable para detección de stuck (default: 30 min)
+- Re-encolado automático de Cloud Tasks al reintentar
+- Contador de reintentos y metadata de retry
+- Actualización automática de stats de proyecto al fallar workflows
+- Soporte para reintentar workflows en estado `error` con `include_error: true`
+
+**Casos de Uso:**
+- Recuperar de timeouts de ElevenLabs/Gemini
+- Manejar Cloud Tasks que nunca completaron
+- Limpiar workflows huérfanos en proyectos
+- Documentar razón de fallo para auditoría
+
+**Documentación:**
+- Nueva sección "Workflow Recovery" en API Reference
+- Patrones de UI para monitoreo y recuperación
+- Ejemplos de código frontend incluidos
+
+---
 
 ### v1.6.0 (2025-12) - Phase 5: Advanced ML/AI Pipeline
 

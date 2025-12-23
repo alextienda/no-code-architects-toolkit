@@ -156,7 +156,8 @@ function uploadWithProgress(file, uploadUrl, contentType, onProgress) {
 7. [Ejemplos de Código](#ejemplos-de-código)
 8. [Manejo de Errores](#manejo-de-errores)
 9. [Cloud Tasks Integration](#cloud-tasks-integration)
-10. [Best Practices](#best-practices)
+10. [Workflow Recovery (Retry / Fail)](#workflow-recovery-retry--fail) ← **Nuevo**
+11. [Best Practices](#best-practices)
 
 ---
 
@@ -1610,6 +1611,176 @@ try {
   showErrorToUser(error.message);
 }
 ```
+
+---
+
+## Workflow Recovery (Retry / Fail)
+
+Cuando un workflow queda "stuck" (atascado en un estado de procesamiento por demasiado tiempo), puedes usar los endpoints de recuperación.
+
+### Estados "Stuck"
+
+| Estado | Tiempo esperado | Si pasa más de 30 min |
+|--------|-----------------|----------------------|
+| `transcribing` | 30-120s | Probablemente stuck |
+| `analyzing` | 20-60s | Probablemente stuck |
+| `processing` | 5-15s | Probablemente stuck |
+| `generating_preview` | 10-45s | Probablemente stuck |
+| `rendering` | 60-180s | Probablemente stuck |
+
+### Detectar Workflows Stuck
+
+```javascript
+const STUCK_STATES = ['transcribing', 'analyzing', 'processing', 'generating_preview', 'rendering'];
+const STUCK_THRESHOLD_MINUTES = 30;
+
+function isWorkflowStuck(workflow) {
+  if (!STUCK_STATES.includes(workflow.status)) return false;
+
+  const updatedAt = new Date(workflow.updated_at);
+  const minutesSinceUpdate = (Date.now() - updatedAt) / 1000 / 60;
+  return minutesSinceUpdate > STUCK_THRESHOLD_MINUTES;
+}
+
+// Verificar todos los workflows de un proyecto
+async function getStuckWorkflows(projectId) {
+  const response = await fetch(`${API_BASE_URL}/v1/autoedit/project/${projectId}/videos`, {
+    headers: { 'X-API-Key': API_KEY }
+  });
+  const { videos } = await response.json();
+  return videos.filter(isWorkflowStuck);
+}
+```
+
+### Reintentar un Workflow Individual
+
+```javascript
+async function retryWorkflow(workflowId, fromStep = null) {
+  const body = fromStep ? { from_step: fromStep } : {};
+
+  const response = await fetch(`${API_BASE_URL}/v1/autoedit/workflow/${workflowId}/retry`, {
+    method: 'POST',
+    headers: { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  const result = await parseNCAResponse(response);
+  console.log(`Workflow ${workflowId} queued for retry from ${result.step_to_retry}`);
+  return result;
+}
+
+// Ejemplos:
+await retryWorkflow('wf_123');  // Auto-detecta paso
+await retryWorkflow('wf_123', 'transcription');  // Desde paso específico
+await retryWorkflow('wf_123', 'analysis');
+```
+
+### Marcar Workflow como Fallido
+
+```javascript
+async function failWorkflow(workflowId, reason) {
+  const response = await fetch(`${API_BASE_URL}/v1/autoedit/workflow/${workflowId}/fail`, {
+    method: 'POST',
+    headers: { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason })
+  });
+
+  const result = await parseNCAResponse(response);
+  console.log(`Workflow ${workflowId} marked as failed: ${reason}`);
+  return result;
+}
+
+// Ejemplo:
+await failWorkflow('wf_123', 'ElevenLabs timeout después de 60 minutos');
+```
+
+### Reintentar Todos los Stuck de un Proyecto
+
+```javascript
+async function retryStuckInProject(projectId, options = {}) {
+  const {
+    thresholdMinutes = 30,
+    includeError = false,
+    workflowIds = null
+  } = options;
+
+  const response = await fetch(`${API_BASE_URL}/v1/autoedit/project/${projectId}/retry-stuck`, {
+    method: 'POST',
+    headers: { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      stuck_threshold_minutes: thresholdMinutes,
+      include_error: includeError,
+      workflow_ids: workflowIds
+    })
+  });
+
+  const result = await parseNCAResponse(response);
+  console.log(`Retried ${result.retried_count}, skipped ${result.skipped_count}`);
+  return result;
+}
+
+// Ejemplos:
+await retryStuckInProject('proj_123');  // Umbral 30 min por defecto
+await retryStuckInProject('proj_123', { thresholdMinutes: 15 });  // Más agresivo
+await retryStuckInProject('proj_123', { includeError: true });  // También reintentar errores
+```
+
+### UI Pattern: Alerta de Stuck Workflows
+
+```javascript
+// Verificar periódicamente (cada 5 minutos)
+setInterval(async () => {
+  const stuckWorkflows = await getStuckWorkflows(currentProjectId);
+
+  if (stuckWorkflows.length > 0) {
+    showStuckAlert(stuckWorkflows);
+  }
+}, 5 * 60 * 1000);
+
+function showStuckAlert(stuckWorkflows) {
+  showModal({
+    title: `${stuckWorkflows.length} video(s) atascados`,
+    message: 'Algunos videos no han progresado en más de 30 minutos.',
+    actions: [
+      {
+        label: 'Reintentar Todos',
+        variant: 'primary',
+        onClick: async () => {
+          const result = await retryStuckInProject(currentProjectId);
+          showToast(`Reintentando ${result.retried_count} workflow(s)`);
+        }
+      },
+      {
+        label: 'Marcar como Fallidos',
+        variant: 'danger',
+        onClick: async () => {
+          for (const wf of stuckWorkflows) {
+            await failWorkflow(wf.workflow_id, 'Timeout - marcado manualmente');
+          }
+          showToast('Workflows marcados como fallidos');
+        }
+      },
+      {
+        label: 'Ignorar',
+        variant: 'secondary',
+        onClick: () => closeModal()
+      }
+    ]
+  });
+}
+```
+
+### Estados Visuales Recomendados
+
+| Estado del Workflow | Color Badge | Icono | Acciones Disponibles |
+|---------------------|-------------|-------|---------------------|
+| Procesando (normal) | 🔵 Azul | Spinner | Esperar |
+| Stuck (> 30 min) | 🟠 Naranja | ⚠️ | Retry, Fail |
+| Error | 🔴 Rojo | ❌ | Retry, Ver detalles |
+| Completado | 🟢 Verde | ✓ | Ver resultado |
+| HITL pendiente | 🟣 Púrpura | ✋ | Revisar |
+
+---
 
 ## Best Practices
 
